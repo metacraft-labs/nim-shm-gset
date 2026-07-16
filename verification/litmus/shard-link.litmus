@@ -1,0 +1,37 @@
+C shard-link
+(*
+ * nim-shm-set shard-append publish (src/shm_set.nim `appendShardFile`), design
+ * spec §4.5(a) / §4.3.1 "publish-before-write".
+ *
+ * A new shard is FULLY initialised (its header magic release-stored) and its
+ * mapping munmap'd BEFORE the file is linked under its final name. Cross-process
+ * the happens-before is carried by the filesystem link + re-established by the
+ * consumer's header-magic ACQUIRE when it maps the new shard (see
+ * header-magic.litmus). herd7 models shared MEMORY, not files, so here we pin
+ * the in-memory half: the release edge that must sit BEFORE the "linked"
+ * publication, and the acquire an observer performs AFTER seeing the link.
+ *
+ * MP shape: `linked` is the flag (stand-in for the final-name file becoming
+ * visible), the shard header word is the data. Forbidden: an observer that sees
+ * the shard linked but not its initialised header. This is the memory-ordering
+ * obligation `appendShardFile` satisfies by release-storing the magic before
+ * link() and by consumers acquire-loading the magic after open().
+ *
+ * EXPECTED (x86-TSO, ARMv8, RISCV): "Never" -> Forbidden.
+ *)
+{
+  shard_hdr = 0;
+  linked    = 0;
+}
+
+P0 (int *shard_hdr, atomic_int *linked) {
+  *shard_hdr = 1;                                           (* initShardHeader *)
+  atomic_store_explicit(linked, 1, memory_order_release);   (* link() publishes *)
+}
+
+P1 (int *shard_hdr, atomic_int *linked) {
+  int r1 = atomic_load_explicit(linked, memory_order_acquire); (* observe file *)
+  int r2 = *shard_hdr;                                         (* map + read hdr *)
+}
+
+exists (1:r1=1 /\ 1:r2=0)

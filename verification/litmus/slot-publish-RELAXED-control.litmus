@@ -1,0 +1,30 @@
+C slot-publish-RELAXED-control
+(*
+ * NEGATIVE CONTROL for slot-publish.litmus. Identical MP shape but the slot is
+ * published/observed with memory_order_relaxed instead of release/acquire —
+ * i.e. the ordering the shipped code does NOT use. This proves the litmus is
+ * meaningful: on a weak model (ARMv8, RISCV) the torn read IS allowed here, so
+ * the `exists` outcome is OBSERVABLE. It documents WHY the shipped acquire on
+ * the slot load (and release on the CAS) is load-bearing rather than decorative.
+ *
+ * EXPECTED: herd7 -model aarch64 / riscv -> "Sometimes" (outcome ALLOWED, i.e.
+ * the bug would be reachable without the shipped ordering). Under x86-TSO the
+ * store->store and load->load are not reordered, so it stays Never there — the
+ * exact "passes on x86, faults on ARM" trap §4.5 warns about.
+ *)
+{
+  rec_fp = 0;
+  slot   = 0;
+}
+
+P0 (int *rec_fp, atomic_int *slot) {
+  *rec_fp = 42;
+  atomic_store_explicit(slot, 1, memory_order_relaxed);    (* WRONG: relaxed *)
+}
+
+P1 (int *rec_fp, atomic_int *slot) {
+  int r1 = atomic_load_explicit(slot, memory_order_relaxed); (* WRONG: relaxed *)
+  int r2 = *rec_fp;
+}
+
+exists (1:r1=1 /\ 1:r2=0)

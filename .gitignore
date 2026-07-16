@@ -10,3 +10,11 @@ tests/test_shm_set_concurrency
 tests/test_shm_set_threads
 tests/test_shm_set_soak
 benchmarks/bench_transports
+# TLC model-checker scratch (state graph, translation backups)
+verification/tla/states/
+verification/tla/*.old
+verification/tla/*.st
+# C11-core verification build artifacts
+verification/core/*.o
+verification/core/shm_set_core_run
+verification/core/shm_set_core_aarch64

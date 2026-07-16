@@ -36,8 +36,47 @@ test-sanitizers:
 
 # Longer parameterizable many-process soak (design spec §4.5(f)). The default in
 # `test` is a short 2s; use this for a longer bounded run, e.g. `just soak 300`.
+# The multi-HOUR version (hours, on x86 AND ARM64) is a CI concern; this target is
+# the same harness, just run longer.
 soak seconds="60":
     SHM_SET_SOAK_SECONDS={{seconds}} nim c -r {{nim_flags}} tests/test_shm_set_soak.nim
+
+# Valgrind DRD + helgrind (design spec §4.5(g)) — a SECOND, happens-before race
+# detector alongside TSAN, over the single-process thread harness (the SAME
+# atomics that ship). Scaled down via env because the tools add a ~30-50x
+# slowdown. NOTE ON COVERAGE: like TSAN, DRD/helgrind track shadow state by
+# VIRTUAL ADDRESS, and each thread/process `mmap`s the file-backed segment at its
+# OWN base (the real multi-process shape), so these tools cannot observe the
+# cross-mapping shared-segment ordering — they validate thread lifecycle, the
+# process-global temp-name atomic (`gShardTmpSeq`), and the allocator. The
+# cross-mapping release->acquire ordering is proven by the formal/litmus
+# artifacts (verification/) and exercised by the multi-process kill/oracle tests.
+# Both tools run clean (0 errors), so no suppression file is needed.
+test-valgrind:
+    nim c {{nim_flags}} --mm:orc -d:useMalloc --debugger:native \
+        -o:/tmp/shmset-vg-threads tests/test_shm_set_threads.nim
+    SHM_SET_THREADS=3 SHM_SET_PER_THREAD=200 \
+        valgrind --tool=helgrind --error-exitcode=99 /tmp/shmset-vg-threads
+    SHM_SET_THREADS=3 SHM_SET_PER_THREAD=200 \
+        valgrind --tool=drd --error-exitcode=99 /tmp/shmset-vg-threads
+
+# TLA+/TLC model check of the protocol (design spec §4.5(a)). TLC is not in the
+# dev shell, so this target pulls it from nixpkgs on demand. The PlusCal
+# algorithm is already translated (the BEGIN/END TRANSLATION block in
+# shm_set.tla); after editing the PlusCal, re-translate with `pcal shm_set.tla`.
+# Proves LOGICAL protocol safety under interleavings; weak-memory sufficiency is
+# the litmus/GenMC job (verification/litmus, verification/core).
+verify-tla:
+    cd verification/tla && nix shell nixpkgs#tlaplus --command \
+        tlc -config shm_set_MC.cfg shm_set_MC.tla
+
+# rr chaos-mode record + deterministic replay of the multi-process fork oracle
+# (design spec §4.5(f)). Explores rare fork/grow interleavings under a randomised
+# scheduler; every recording asserts `snapshot == union(intended)`. rr needs a HW
+# CPU-cycle counter; on Intel hybrid parts pass RR_BIND_CPU to pin a P-core (the
+# script defaults to cpu0). Tune with RR_CHAOS_ITERS / SHM_SET_SOAK_SECONDS.
+test-rr:
+    bash verification/run-rr-chaos.sh
 
 # Build + run the M1 transport head-to-head benchmark (needs nim-shm-queue).
 bench:

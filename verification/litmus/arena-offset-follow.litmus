@@ -1,0 +1,34 @@
+C arena-offset-follow
+(*
+ * nim-shm-set arena-offset publish->follow (design spec §4.5(a)). The slot does
+ * not hold the record inline; it holds an OFFSET, and the reader must FOLLOW it
+ * to two separate record fields (fp at +0, len at +8) written before publish.
+ * This pins that an ACQUIRE load on the slot (not merely a data/consume
+ * dependency) is what orders the subsequent, differently-addressed record
+ * reads — the shipped code uses loadU64Acquire on the slot AND on the record
+ * fields (entryMatches).
+ *
+ * MP with two payload words behind the published offset. Forbidden: the offset
+ * is observed but either payload word is stale.
+ *
+ * EXPECTED (x86-TSO, ARMv8, RISCV): "Never" -> Forbidden.
+ *)
+{
+  rec_fp  = 0;
+  rec_len = 0;
+  slot    = 0;
+}
+
+P0 (int *rec_fp, int *rec_len, atomic_int *slot) {
+  *rec_fp  = 42;                                           (* record field 0 *)
+  *rec_len = 7;                                            (* record field 1 *)
+  atomic_store_explicit(slot, 1, memory_order_release);    (* publish offset *)
+}
+
+P1 (int *rec_fp, int *rec_len, atomic_int *slot) {
+  int r1 = atomic_load_explicit(slot, memory_order_acquire);
+  int r2 = *rec_fp;
+  int r3 = *rec_len;
+}
+
+exists (1:r1=1 /\ (1:r2=0 \/ 1:r3=0))

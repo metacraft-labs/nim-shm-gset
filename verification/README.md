@@ -1,0 +1,85 @@
+# nim-shm-set — formal / weak-memory verification tier (design spec §4.5)
+
+This directory is the **formal and weak-memory** verification tier for the
+lock-free, multi-process, file-backed G-Set in `../src/shm_set.nim`. It is the
+part-2 complement to the *dynamic* verification that lives in `../tests` (schedule
+-hook interleavings, fork+SIGKILL fault injection, TSAN/ASan/UBSan, the LF-5 and
+position-independence tests) and is wired through the `../Justfile`.
+
+The dangerous bugs in this structure are memory-ordering and interleaving-window
+defects that x86 stress passes for months and that only fault on ARM64, under a
+rare schedule, at a different mmap base, or on an unlucky kill. Functional tests
+alone give false confidence; hence this tier.
+
+## What is RUNNABLE in this repo's dev shell (and was RUN)
+
+| Artifact | Tool | Wired as | Result |
+|---|---|---|---|
+| Protocol model | TLA+ / TLC (`nixpkgs#tlaplus`) | `just verify-tla` | **RAN — green.** 750 distinct states, depth 30, all invariants + 2 temporal props hold |
+| Valgrind DRD + helgrind | `valgrind` (dev shell) | `just test-valgrind` | **RAN — 0 errors** (both tools) |
+| rr chaos record + replay | `rr` (dev shell) | `just test-rr` | **RAN — green.** Oracle held across 5 chaos schedules + 1 deterministic replay |
+| Longer bounded soak | Nim (dev shell) | `just soak <secs>` | **RAN — green** (60 s: distinct=7200, growthFailures=0) |
+| C11 atomics core, native | `gcc` (dev shell) | `core/` `-DSTANDALONE` | **RAN — green** (200000 slot-claim races) + TSAN clean |
+| C11 atomics core, aarch64 | cross-gcc + `qemu-aarch64` | `core/build-aarch64-qemu.sh` | **RAN — green, FUNCTIONAL ONLY** (see caveat) |
+
+### Coverage boundaries of the RUN items (read this)
+
+- **TLC** explores **sequentially-consistent interleavings**. It proves the
+  *logical* protocol is correct given correct ordering (no lost element, no
+  phantom, exact union, chain integrity/no-lost-shard, idempotent dedup, grow
+  arbitration, reaper flock safety, liveness). It does **not** model ARMv8/RISC-V
+  reordering — that is the litmus / GenMC job below.
+- **DRD / helgrind** (like TSAN) track shadow state by **virtual address**, and
+  each thread/process `mmap`s the segment at its **own** base (the real multi-
+  process shape), so they cannot observe the cross-mapping shared-segment
+  ordering. They validate thread lifecycle, the process-global temp-name atomic
+  (`gShardTmpSeq`), and the allocator. The cross-mapping release→acquire ordering
+  is the litmus / GenMC / TLC job.
+- **rr chaos** needs a hardware CPU-cycle counter. On Intel hybrid (P/E-core)
+  parts rr's PMU probe fails unless pinned to one core — the runner passes
+  `--bind-to-cpu` (override with `RR_BIND_CPU`).
+- **qemu-aarch64** does **NOT** faithfully reproduce ARM weak memory. The aarch64
+  run is a **functional** check (ABI, struct layout, atomic-builtin lowering,
+  compile correctness) — it is **not** a weak-memory proof. Real ARM weak-memory
+  coverage needs real hardware or the herd7 / GenMC artifacts below.
+
+## What is AUTHORED but NOT RUN here (tool absent from this nixpkgs pin)
+
+These are complete, ready-to-run artifacts. The exact `nix` attempts that failed
+at authoring time (2026-07-16, this repo's pinned `nixpkgs`):
+
+```
+nix eval nixpkgs#herdtools7.name   -> attribute 'herdtools7' does not exist
+nix eval nixpkgs#herd7.name        -> does not exist
+nix eval nixpkgs#genmc.name        -> does not exist
+nix eval nixpkgs#nidhugg.name      -> does not exist
+nix eval nixpkgs#rcmc.name         -> does not exist
+nix eval nixpkgs#cdschecker.name   -> does not exist
+```
+
+| Artifact | Tool needed | How to run once present |
+|---|---|---|
+| `litmus/*.litmus` (5 shipped-ordering + 1 relaxed control) | herd7 (`herdtools7`) | `nix shell nixpkgs#herdtools7 --command litmus/run-litmus.sh` |
+| `core/shm_set_core.c` under a stateless model checker | GenMC / Nidhugg / CDSChecker | `nix shell nixpkgs#genmc --command genmc -- -unroll=3 core/shm_set_core.c` (or `nidhugg --c11 --unroll=3 …`) |
+
+The litmus tests encode, per hardware model (x86-TSO, ARMv8, RISC-V), the exact
+release→acquire message-passing shape of every publish pair: slot publish, arena
+-offset follow, header-magic attach, shard-link, chain-bump. Each shipped test's
+`exists` clause must be **Forbidden** ("Never"); the `-RELAXED-control` companion
+must be **Allowed** on a weak model, which is what proves the shipped ordering is
+load-bearing (the "passes on x86, faults on ARM" trap).
+
+The C11 core (`core/shm_set_core.c`) is the **same memory orders** the Nim
+library uses (`memory_order_release` slot CAS, `seq_cst` arena bump, `acq_rel`
+chain-bump, `acquire` reader loads) on a tiny forced-collision table with two
+producers — the compilation unit a model checker drives, matching the shipped
+algorithm rather than paraphrasing it.
+
+## Files
+
+- `tla/shm_set.tla` — PlusCal model + embedded TLA+ translation + invariants.
+- `tla/shm_set_MC.{tla,cfg}` — the finite TLC instance (3 elements, 2-slot shard,
+  forced grow) and its config.
+- `litmus/*.litmus` — herd7 litmus tests (+ `run-litmus.sh`).
+- `core/shm_set_core.c` — extracted C11 atomics core (+ `build-aarch64-qemu.sh`).
+- `run-rr-chaos.sh` — rr chaos record/replay driver (used by `just test-rr`).

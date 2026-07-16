@@ -16,9 +16,16 @@
 import std/[os, posix, sets, strutils]
 import shm_set
 
-const
-  nThreads = 6
-  perThread = 800
+# Geometry defaults match the historical fast functional/TSAN run. They can be
+# scaled DOWN via env for the much slower happens-before detectors (valgrind
+# DRD/helgrind, `just test-valgrind`), which run the SAME binary/atomics but at
+# a ~30-50x slowdown, so a smaller distinct set keeps the run bounded while
+# still exercising concurrent slot-claim + grow.
+let
+  nThreads = block:
+    try: max(1, parseInt(getEnv("SHM_SET_THREADS", "6"))) except ValueError: 6
+  perThread = block:
+    try: max(1, parseInt(getEnv("SHM_SET_PER_THREAD", "800"))) except ValueError: 800
 
 var gPath0: string
 
@@ -45,7 +52,7 @@ when isMainModule:
   doAssert host.available
   gPath0 = host.path0
 
-  var ts: array[nThreads, Thread[int]]
+  var ts = newSeq[Thread[int]](nThreads)
   for i in 0 ..< nThreads: createThread(ts[i], inserter, i)
   for i in 0 ..< nThreads: joinThread(ts[i])
 

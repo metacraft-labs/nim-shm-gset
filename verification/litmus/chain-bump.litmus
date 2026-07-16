@@ -1,0 +1,36 @@
+C chain-bump
+(*
+ * nim-shm-set chain-count publish (src/shm_set.nim `bumpChainCountTo` ->
+ * `chainCount`/`insert`), design spec §4.5(a).
+ *
+ * After a new shard is linked, a producer bumps shard0's chainCount with a
+ * release CAS (casU64 ShOffChainCount, ATOMIC_ACQ_REL). Another producer/reader
+ * acquire-loads chainCount (loadU64Acquire) and, seeing the higher count, opens
+ * and reads the newly-linked shard. The release->acquire on chainCount is what
+ * lets a peer that observes count=N+1 safely conclude shard N (0-based) is
+ * present and initialised.
+ *
+ * MP shape: chainCount is the flag, the new shard's observable state the data.
+ * Forbidden: a peer sees the bumped count but not the shard it announces.
+ * (The reader is ALSO robust to a LOST bump via its directory scan
+ * `discoverMaxShard` — that belt-and-suspenders recovery is checked in the TLA+
+ * model and the SIGKILL-at-spBeforeChainBump concurrency test, not here.)
+ *
+ * EXPECTED (x86-TSO, ARMv8, RISCV): "Never" -> Forbidden.
+ *)
+{
+  new_shard = 0;
+  chainCount = 1;
+}
+
+P0 (int *new_shard, atomic_int *chainCount) {
+  *new_shard = 1;                                            (* shard linked+init *)
+  atomic_store_explicit(chainCount, 2, memory_order_release); (* bump N -> N+1 *)
+}
+
+P1 (int *new_shard, atomic_int *chainCount) {
+  int r1 = atomic_load_explicit(chainCount, memory_order_acquire);
+  int r2 = *new_shard;                                       (* open the shard *)
+}
+
+exists (1:r1=2 /\ 1:r2=0)

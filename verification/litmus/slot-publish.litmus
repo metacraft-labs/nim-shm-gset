@@ -1,0 +1,35 @@
+C slot-publish
+(*
+ * nim-shm-set slot-claim publish (src/shm_set.nim `insertIntoShard` ->
+ * reader/`entryMatches`), design spec io-mon-Lossless-Event-Capture §4.5(a).
+ *
+ * The SHIPPED release->acquire pair:
+ *   producer: writes the arena record bytes (relaxed stores), then publishes
+ *             the slot with ONE release CAS 0 -> arena-offset
+ *             (casU64 ... ATOMIC_ACQ_REL).
+ *   reader:   acquire-loads the slot (loadU64Acquire), and only if it is
+ *             non-zero dereferences the arena record it points at.
+ *
+ * The message-passing (MP) shape below forbids the ONE reordering that would
+ * break torn-key safety: a reader observing the published offset but NOT the
+ * record bytes written before it. With release/acquire honored (x86-TSO,
+ * ARMv8, RISCV) the `exists` outcome is impossible.
+ *
+ * EXPECTED (all three -model runs): "Never" / 0 matches -> Forbidden.
+ *)
+{
+  rec_fp = 0;
+  slot   = 0;
+}
+
+P0 (int *rec_fp, atomic_int *slot) {
+  *rec_fp = 42;                                            (* arena record bytes *)
+  atomic_store_explicit(slot, 1, memory_order_release);    (* publish the offset *)
+}
+
+P1 (int *rec_fp, atomic_int *slot) {
+  int r1 = atomic_load_explicit(slot, memory_order_acquire); (* observe the slot *)
+  int r2 = *rec_fp;                                          (* follow to record *)
+}
+
+exists (1:r1=1 /\ 1:r2=0)

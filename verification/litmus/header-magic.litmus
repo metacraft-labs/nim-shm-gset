@@ -1,0 +1,33 @@
+C header-magic
+(*
+ * nim-shm-set shard-header publish (src/shm_set.nim `initShardHeader` ->
+ * `headerValid`/`mapShardFromFd`), design spec §4.5(a).
+ *
+ * initShardHeader writes every header field (capacity, slotsOff, arenaOff, ...)
+ * with relaxed/plain stores, then publishes the magic word LAST with a release
+ * store (storeU64Release ShOffMagic). An attacher's headerValid does an ACQUIRE
+ * load of the magic and, only if it matches, reads the geometry fields. So an
+ * attacher that sees a valid magic is guaranteed to see a fully-initialised
+ * header — never a half-written one.
+ *
+ * MP shape: magic is the flag, the geometry field is the data. Forbidden: magic
+ * observed valid but geometry stale.
+ *
+ * EXPECTED (x86-TSO, ARMv8, RISCV): "Never" -> Forbidden.
+ *)
+{
+  capacity = 0;
+  magic    = 0;
+}
+
+P0 (int *capacity, atomic_int *magic) {
+  *capacity = 128;                                          (* geometry field *)
+  atomic_store_explicit(magic, 1, memory_order_release);    (* publish magic LAST *)
+}
+
+P1 (int *capacity, atomic_int *magic) {
+  int r1 = atomic_load_explicit(magic, memory_order_acquire); (* headerValid *)
+  int r2 = *capacity;                                         (* read geometry *)
+}
+
+exists (1:r1=1 /\ 1:r2=0)
