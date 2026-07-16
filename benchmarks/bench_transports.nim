@@ -326,7 +326,28 @@ when isMainModule:
   echo "LF-1 (zero loss / zero phantom, all lossless models): ",
     (not setRes.lossOrPhantom) and (not setOnce.lossOrPhantom) and
     (not ringRes.lossOrPhantom)
+  # CORRECTNESS is asserted, not merely printed: the authoritative asserting
+  # proofs live in the unit tests (tests/test_shm_set.nim multi-process oracle;
+  # nim-shm-queue tests/test_ring_block_producer.nim for A). These doAsserts are
+  # a SECONDARY guard so a zero-loss/phantom or LF-4 regression FAILS the bench
+  # LOUDLY (non-zero exit) instead of silently printing `false`/`FAIL`. The
+  # measurement numbers above stay echo-only; only the correctness verdicts here
+  # become assertions.
+  doAssert not setRes.lossOrPhantom,
+    "C: nim-shm-set (sharded G-Set): zero-loss/phantom oracle regressed"
+  doAssert not setOnce.lossOrPhantom,
+    "C': nim-shm-set (size-once): zero-loss/phantom oracle regressed"
+  doAssert not ringRes.lossOrPhantom,
+    "A: nim-shm-queue ring (opBlockProducer): zero-loss/phantom oracle regressed"
   echo "LF-4 killed-consumer:"
-  echo "  ", lf4SetDemo(dir)
-  echo "  ", lf4RingDemo(dir)
+  let lf4Set = lf4SetDemo(dir)
+  echo "  ", lf4Set
+  doAssert lf4Set.startsWith("PASS"),
+    "C: nim-shm-set LF-4 regressed (killed consumer must not hang a producer): " &
+    lf4Set
+  let lf4Ring = lf4RingDemo(dir)
+  echo "  ", lf4Ring
+  doAssert lf4Ring.startsWith("PASS"),
+    "A: nim-shm-queue ring LF-4 regressed (blocked producer must return " &
+    "prConsumerGone, not hang): " & lf4Ring
   removeDir(dir)

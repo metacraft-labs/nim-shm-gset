@@ -193,3 +193,23 @@ suite "reaper (cross-restart GC)":
     check (not fileExists(deadAnchor))      # dead-owner chain removed
     check fileExists(live.path0)            # live-owner chain untouched
     live.detach()
+
+  test "a wrong-bootid run is reaped even though its owner pid is live":
+    # Isolates the OTHER staleness axis (§4.3.4): a shard chain that survived a
+    # REBOOT ⇒ its recorded boot-id != the current boot-id ⇒ pids are meaningless
+    # across the reboot ⇒ reap it, EVEN IF a live process happens to hold the
+    # recorded pid on the current boot. We forge a shard0 whose owner pid is THIS
+    # (alive) process but whose boot-id is deliberately not the current one, so
+    # only the boot-id mismatch — not pid-death — can make it stale.
+    let dir = freshDir("reapboot")
+    defer: removeDir(dir)
+    let wrongBoot = bootId() + 1          # any value != the current boot-id
+    let livePid = uint64(getpid())        # a pid that IS alive on this boot
+    let stalePrefix = shardBasePrefix(dir, "rebootedEdge", wrongBoot, livePid)
+    let staleAnchor = stalePrefix & ".shard0"
+    writeFile(staleAnchor, "forged wrong-boot shard0")
+    check fileExists(staleAnchor)
+
+    let reaped = reapStaleSegments(dir)
+    check reaped >= 1
+    check (not fileExists(staleAnchor))   # wrong-boot chain reaped despite live pid
