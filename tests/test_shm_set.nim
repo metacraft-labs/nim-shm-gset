@@ -1,0 +1,195 @@
+## Functional + concurrency suite for `nim-shm-set` (Candidate C).
+##
+## Covers: idempotent membership, dedup-at-source, growth by SHARDING (never
+## drop), the single-threaded union/merge, position-independence ACROSS PROCESS
+## boundaries (fork → different address space, offsets-only), the ground-truth
+## oracle (final == union(intended): zero loss, zero phantom), SIGNALLED
+## growth-failure, and the cross-restart reaper.
+
+import std/[os, posix, sets, strutils, unittest]
+import shm_set
+
+proc cExit(code: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
+proc quitChild(code: cint) {.noreturn.} = cExit(code)
+
+var tmpCtr = 0
+proc freshDir(tag: string): string =
+  inc tmpCtr
+  result = getTempDir() / ("shmset-" & tag & "-" & $getpid() & "-" & $tmpCtr)
+  removeDir(result)
+  createDir(result)
+
+proc bytesOf(s: string): seq[byte] =
+  result = newSeq[byte](s.len)
+  for i, c in s: result[i] = byte(c)
+
+proc strOf(b: seq[byte]): string =
+  result = newString(b.len)
+  for i in 0 ..< b.len: result[i] = char(b[i])
+
+# --- basic membership + idempotency ----------------------------------------
+
+suite "membership + idempotent inserts":
+  test "insert / contains / dedup":
+    let dir = freshDir("basic")
+    defer: removeDir(dir)
+    var s = createSet(dir, "edge", shard0Cap = 64, shard0ArenaCap = 8192)
+    check s.available
+    check s.insert(bytesOf("alpha")) == isInserted
+    check s.insert(bytesOf("beta")) == isInserted
+    check s.insert(bytesOf("alpha")) == isExists   # idempotent
+    check s.insert(bytesOf("alpha")) == isExists
+    check s.contains(bytesOf("alpha"))
+    check s.contains(bytesOf("beta"))
+    check (not s.contains(bytesOf("gamma")))
+    check s.insert(newSeq[byte](0)) == isInserted   # empty element allowed
+    check s.contains(newSeq[byte](0))
+    let snap = s.snapshot()
+    check snap.len == 3                              # alpha, beta, empty
+    check s.growthFailures() == 0
+    s.detach()
+
+  test "many distinct elements force SHARDING; snapshot is the exact union":
+    let dir = freshDir("shard")
+    defer: removeDir(dir)
+    # Tiny shard0 so growth is forced quickly (load factor 0.5 on 64 slots).
+    var s = createSet(dir, "edge", shard0Cap = 64, shard0ArenaCap = 2048)
+    check s.available
+    var expected = initHashSet[string]()
+    for i in 0 ..< 2000:
+      let e = "path/to/file-" & $i & ".h"
+      expected.incl e
+      check s.insert(bytesOf(e)) in {isInserted, isExists}
+      # Re-observe (probe storm). Idempotent WITHIN a shard generation; across a
+      # growth an element in an older shard is re-added to the newest shard at
+      # most once (the harmless cross-shard duplicate the union folds), so both
+      # outcomes are valid — what must hold is exactness of the final union.
+      check s.insert(bytesOf(e)) in {isInserted, isExists}
+    check s.shardCount() > 1                         # it actually sharded
+    check s.growthFailures() == 0
+    var got = initHashSet[string]()
+    for e in s.items: got.incl strOf(e)
+    check got.len == expected.len                    # zero loss, zero phantom
+    check got == expected
+    # Cross-shard duplication is bounded: the claimed-slot UPPER bound stays
+    # close to the true distinct count (dedup-at-source works), never blowing up
+    # toward the event count.
+    check s.claimedSlots() < uint64(expected.len * 2)
+    s.detach()
+
+# --- position-independence (offsets only, no absolute pointers) -------------
+
+suite "position-independence (design spec §4.5(b))":
+  test "a second independent mapping at a DIFFERENT base sees the same set":
+    let dir = freshDir("posindep")
+    defer: removeDir(dir)
+    var owner = createSet(dir, "edge", shard0Cap = 64, shard0ArenaCap = 2048)
+    check owner.available
+    var expected = initHashSet[string]()
+    for i in 0 ..< 1500:               # force several shards
+      let e = "elem-" & $i
+      expected.incl e
+      discard owner.insert(bytesOf(e))
+    check owner.shardCount() > 1
+
+    # Attach a SECOND view of the same chain in this process. `mmap(nil, …)` picks
+    # a fresh virtual address, so this mapping's base differs from `owner`'s — if
+    # any absolute pointer had leaked into shared memory, the second view would
+    # dereference garbage. Offsets-only ⇒ identical results.
+    var view = attachSet(owner.path0)
+    check view.available
+    check cast[uint](view.shards0Base()) != cast[uint](owner.shards0Base())
+    for e in expected:
+      check view.contains(bytesOf(e))
+    var got = initHashSet[string]()
+    for e in view.items: got.incl strOf(e)
+    check got == expected
+    view.detach(); owner.detach()
+
+# --- ground-truth oracle across MANY fork producers ------------------------
+
+suite "multi-process oracle (zero loss / zero phantom)":
+  test "N children each insert an intended set with heavy duplication":
+    let dir = freshDir("oracle")
+    defer: removeDir(dir)
+    const
+      nProc = 4
+      perProc = 900         # distinct per child
+      dupFactor = 8         # re-observe each element 8x (probe-storm shape)
+    var s = createSet(dir, "edge", shard0Cap = 128, shard0ArenaCap = 4096)
+    check s.available
+    let path0 = s.path0
+
+    var pids: seq[Pid]
+    for c in 0 ..< nProc:
+      let pid = fork()
+      if pid == 0:
+        var cs = attachSet(path0)
+        if not cs.available: quitChild(2)
+        for j in 0 ..< perProc:
+          let e = bytesOf("c" & $c & "/dep-" & $j)
+          for _ in 0 ..< dupFactor:
+            if cs.insert(e) notin {isInserted, isExists}:
+              cs.detach(); quitChild(3)   # saturation / unavailable = failure
+        cs.detach()
+        quitChild(0)
+      else:
+        check pid > 0
+        pids.add(pid)
+
+    for pid in pids:
+      var st: cint
+      check waitpid(pid, st, 0) == pid
+      check WIFEXITED(st)
+      check WEXITSTATUS(st) == 0
+
+    # ORACLE: the merged set must equal the union of every child's intended set,
+    # exactly — no loss, no phantom.
+    var expected = initHashSet[string]()
+    for c in 0 ..< nProc:
+      for j in 0 ..< perProc:
+        expected.incl("c" & $c & "/dep-" & $j)
+    var got = initHashSet[string]()
+    for e in s.items: got.incl strOf(e)
+    check got.len == nProc * perProc
+    check got == expected
+    check s.growthFailures() == 0
+    check s.shardCount() >= 1
+    echo "  [oracle] distinct=", got.len, " shards=", s.shardCount(),
+      " claimedSlots(UB)=", s.claimedSlots()
+    s.detach()
+
+# --- reaper -----------------------------------------------------------------
+
+suite "reaper (cross-restart GC)":
+  test "a dead-owner run is reaped; a live-owner run is left alone":
+    let dir = freshDir("reap")
+    defer: removeDir(dir)
+    # Live run (this process owns it).
+    var live = createSet(dir, "liveEdge", shard0Cap = 32, shard0ArenaCap = 1024)
+    check live.available
+    check live.insert(bytesOf("x")) == isInserted
+
+    # Dead-owner run: fork a child that creates a set then exits; reap by pid.
+    let child = fork()
+    if child == 0:
+      var cs = createSet(dir, "deadEdge", shard0Cap = 32, shard0ArenaCap = 1024)
+      if not cs.available: quitChild(2)
+      discard cs.insert(bytesOf("y"))
+      # leak on purpose (no detach/unlink) then exit so its pid dies
+      quitChild(0)
+    var st: cint
+    discard waitpid(child, st, 0)
+
+    # The dead run's shard0 exists on disk.
+    var deadAnchor = ""
+    for _, p in walkDir(dir):
+      if extractFilename(p).startsWith("deadEdge."): deadAnchor = p
+    check deadAnchor.len > 0
+    check fileExists(deadAnchor)
+
+    let reaped = reapStaleSegments(dir)
+    check reaped >= 1
+    check (not fileExists(deadAnchor))      # dead-owner chain removed
+    check fileExists(live.path0)            # live-owner chain untouched
+    live.detach()

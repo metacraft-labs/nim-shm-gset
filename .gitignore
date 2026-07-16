@@ -1,0 +1,7 @@
+# Nim build artifacts
+nimcache/
+*.exe
+# Compiled test / benchmark binaries (no extension on POSIX)
+tests/test_shm_set
+tests/test_shm_set_hooks
+benchmarks/bench_transports
