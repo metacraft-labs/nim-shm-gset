@@ -4,4 +4,9 @@ nimcache/
 # Compiled test / benchmark binaries (no extension on POSIX)
 tests/test_shm_set
 tests/test_shm_set_hooks
+tests/test_shm_set_transport
+tests/test_shm_set_lf5
+tests/test_shm_set_concurrency
+tests/test_shm_set_threads
+tests/test_shm_set_soak
 benchmarks/bench_transports

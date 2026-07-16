@@ -195,7 +195,24 @@ when shmSetSupported:
 
   # --- mmap plumbing --------------------------------------------------------
 
+  when defined(shmSetScheduleHooks):
+    var forcedNextMapBase {.threadvar.}: pointer
+    proc setForcedNextMapBase*(p: pointer) =
+      ## TEST-ONLY (design spec §4.5(b)): force the NEXT shard `mmap` to land at a
+      ## deliberately chosen base via `MAP_FIXED`, so a test can prove the segment
+      ## is position-independent (offsets only, no absolute pointers) even at a
+      ## base of the test's choosing. The hint is consumed by one map and cleared.
+      forcedNextMapBase = p
+
   proc mapFd(fd: cint; size: int): ShmBase =
+    when defined(shmSetScheduleHooks):
+      if forcedNextMapBase != nil:
+        let want = forcedNextMapBase
+        forcedNextMapBase = nil
+        let pf = mmap(want, size, PROT_READ or PROT_WRITE,
+          MAP_SHARED or MAP_FIXED, fd, 0)
+        if pf == MAP_FAILED: return nil
+        return cast[ShmBase](pf)
     let p = mmap(nil, size, PROT_READ or PROT_WRITE, MAP_SHARED, fd, 0)
     if p == MAP_FAILED: return nil
     cast[ShmBase](p)
@@ -337,6 +354,14 @@ when shmSetSupported:
     let occ = loadU64Relaxed(sm.base, ShOffOccupied)
     occ * uint64(LoadDen) >= uint64(sm.cap * LoadNum)
 
+  # Process-global tmp uniquifier. A per-`ShmSet` counter is NOT enough: two
+  # producer THREADS in the same process share `getpid()` and both start their
+  # own `tmpCtr` at 1, so they would forge the SAME `.shardtmp.<pid>.1` name and
+  # the `O_EXCL` loser's `EEXIST` would be misreported as a growth failure
+  # (SIGNALLED saturation) even though growth succeeded. An atomic process-global
+  # sequence makes every temp name unique across threads.
+  var gShardTmpSeq: uint64
+
   proc appendShardFile(s: var ShmSet; newIndex, newCap, newArenaCap: int): bool =
     ## Create shard `newIndex` if absent, publishing it fully-initialised under
     ## its final name via an EXCLUSIVE `link` (double-grow arbitration: the loser
@@ -345,10 +370,20 @@ when shmSetSupported:
     let finalPath = shardPath(s, newIndex)
     if fileExists(finalPath): return true
     let size = shardFileSize(newCap, newArenaCap)
-    inc s.tmpCtr
-    let tmp = s.basePrefix & ".shardtmp." & $getpid() & "." & $s.tmpCtr
-    let tfd = open(tmp.cstring, O_RDWR or O_CREAT or O_EXCL, 0o600)
-    if tfd < 0: return false
+    var tfd = cint(-1)
+    var tmp: string
+    var attempts = 0
+    while true:
+      let uniq = atomicAddFetch(addr gShardTmpSeq, 1'u64, ATOMIC_SEQ_CST)
+      tmp = s.basePrefix & ".shardtmp." & $getpid() & "." & $uniq
+      tfd = open(tmp.cstring, O_RDWR or O_CREAT or O_EXCL, 0o600)
+      if tfd >= 0: break
+      # A colliding temp NAME (a sibling producer thread in this same process, or
+      # a stale leftover from a crashed same-pid run) must NOT be reported as a
+      # growth failure — pick a fresh name and retry. Any other error is real.
+      if errno != EEXIST: return false
+      inc attempts
+      if attempts > 4096: return false
     if ftruncate(tfd, Off(size)) != 0:
       discard close(tfd); discard unlink(tmp.cstring); return false
     let base = mapFd(tfd, size)
@@ -558,6 +593,39 @@ when shmSetSupported:
     if s.available and s.shards.len > 0 and not s.shards[0].base.isNil:
       storeU64Release(s.shards[0].base, ShOffConsumerAlive, 0)
 
+  proc consumerAlive*(s: ShmSet): bool =
+    ## Whether the host/consumer that owns shard0 is still registered as live
+    ## (LF-4). The producer interface (`transport`) surfaces this as
+    ## `emConsumerGone` so a monitored process learns to stop writing to an
+    ## orphaned segment instead of silently accumulating unread state.
+    if not s.available or s.shards.len == 0 or s.shards[0].base.isNil: return false
+    loadU64Acquire(s.shards[0].base, ShOffConsumerAlive) != 0'u64
+
+  proc assertNoAbsolutePointers*(s: var ShmSet) =
+    ## DEBUG (design spec §4.5(b)): assert every stored slot value is an in-shard
+    ## OFFSET, never an absolute pointer into the mapping. A leaked absolute
+    ## pointer would either fall inside the mapping's address window
+    ## `[base, base+size)` or exceed the shard size; either is a
+    ## position-independence bug that would fault at a different mmap base.
+    let maxK = discoverMaxShard(s)
+    for k in 0 .. maxK:
+      if not openShard(s, k): continue
+      let sm = s.shards[k]
+      let lo = cast[uint](sm.base)
+      let hi = lo + uint(sm.size)
+      for idx in 0 ..< sm.cap:
+        let entry = loadU64Acquire(sm.base, sm.slotsOff + idx * SlotSize)
+        if entry == 0'u64: continue
+        doAssert entry < uint64(sm.size),
+          "slot entry " & $entry & " is not an in-shard offset (>= size " &
+          $sm.size & "): absolute-pointer leak"
+        let a = uint(entry)
+        doAssert not (a >= lo and a < hi),
+          "stored slot value falls inside the mapping window: absolute pointer"
+        let rlen = int(loadU32Acquire(sm.base, int(entry) + ArenaRecLen))
+        doAssert int(entry) + ArenaRecHdr + rlen <= sm.size,
+          "arena record overruns the shard (torn/corrupt offset)"
+
   proc shards0Base*(s: ShmSet): pointer =
     ## The mapped base address of shard0 in THIS process (for the
     ## position-independence test, which asserts two processes/mappings observe
@@ -638,5 +706,7 @@ else:
   proc claimedSlots*(s: var ShmSet): uint64 = 0
   proc growthFailures*(s: var ShmSet): uint64 = 0
   proc markConsumerGone*(s: var ShmSet) = discard
+  proc consumerAlive*(s: ShmSet): bool = false
+  proc assertNoAbsolutePointers*(s: var ShmSet) = discard
   proc shards0Base*(s: ShmSet): pointer = nil
   proc reapStaleSegments*(dir: string): int = 0
