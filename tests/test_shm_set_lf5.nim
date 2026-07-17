@@ -38,7 +38,7 @@ suite "LF-5 (oversize is not loss)":
     defer: removeDir(dir)
     # Tiny arena so the big element cannot fit in shard0 and MUST force a grow.
     const arenaCap = 2048
-    var s = createSet(dir, "edge", shard0Cap = 64, shard0ArenaCap = arenaCap)
+    var s = createSet(dir, "io-mon", "edge", shard0Cap = 64, shard0ArenaCap = arenaCap)
     check s.available
 
     # An element several times the arena capacity: growth (arena *= GrowthFactor
@@ -71,7 +71,7 @@ suite "LF-5 (oversize is not loss)":
     let dir = freshDir("sat")
     defer: removeDir(dir)
     # Small geometry so growth is attempted quickly.
-    var s = createSet(dir, "edge", shard0Cap = 32, shard0ArenaCap = 1024)
+    var s = createSet(dir, "io-mon", "edge", shard0Cap = 32, shard0ArenaCap = 1024)
     check s.available
     let path0 = s.path0
 

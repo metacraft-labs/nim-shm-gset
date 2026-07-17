@@ -73,11 +73,14 @@ proc detach*(p: var SetProducer) = p.s.detach()
 
 # --- consumer / host side ---------------------------------------------------
 
-proc startHost*(dir, runId: string; shard0Cap = 1024;
+proc startHost*(dir, runId: string; appId = "io-mon"; shard0Cap = 1024;
     shard0ArenaCap = 256 * 1024): SetHost =
   ## Create shard0 (the well-known anchor) and register this process as the live
-  ## consumer. Hand `path0` to producers via `REPRO_MONITOR_DEP_SHM`.
-  result.s = createSet(dir, runId, shard0Cap = shard0Cap,
+  ## consumer. Hand `path0` to producers via `REPRO_MONITOR_DEP_SHM`. `appId`
+  ## scopes the cross-restart reaper so one app never reaps another's segments
+  ## (defaults to `"io-mon"`; a different consumer, e.g. reprobuild/codetracer,
+  ## passes its own tag).
+  result.s = createSet(dir, appId, runId, shard0Cap = shard0Cap,
     shard0ArenaCap = shard0ArenaCap)
 
 proc available*(h: SetHost): bool = h.s.available

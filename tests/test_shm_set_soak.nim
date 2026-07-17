@@ -31,7 +31,7 @@ when isMainModule:
   let dir = getTempDir() / ("shmset-soak-" & $getpid())
   removeDir(dir); createDir(dir)
   # Tiny shards ⇒ maximal sharding / constant concurrent growth (§4.5(d)).
-  var host = createSet(dir, "edge", shard0Cap = 16, shard0ArenaCap = 512)
+  var host = createSet(dir, "io-mon", "edge", shard0Cap = 16, shard0ArenaCap = 512)
   doAssert host.available
   let path0 = host.path0
 

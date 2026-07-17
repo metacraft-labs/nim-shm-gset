@@ -48,7 +48,7 @@ when isMainModule:
   let dir = getTempDir() / ("shmset-threads-" & $getpid())
   removeDir(dir); createDir(dir)
   # Small geometry so the many threads force real concurrent sharding.
-  var host = createSet(dir, "edge", shard0Cap = 128, shard0ArenaCap = 8192)
+  var host = createSet(dir, "io-mon", "edge", shard0Cap = 128, shard0ArenaCap = 8192)
   doAssert host.available
   gPath0 = host.path0
 

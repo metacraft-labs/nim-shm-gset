@@ -42,9 +42,12 @@ regardless of write order, writer, or duplication.
   allocation on insert).
 - **Single-threaded final merge**: the reader unions all shards into the
   authoritative distinct set (`items` / `snapshot`).
-- **Reaper** (`reapStaleSegments`): cross-restart GC of shard files whose owner
-  is gone (boot-id + owner-pid staleness, `flock`-guarded against a starting
-  run).
+- **Reaper** (`reapStaleSegments(dir, appId)`): cross-restart GC of shard files
+  whose owner is gone (boot-id + owner-pid staleness, `flock`-guarded against a
+  starting run). SCOPED to one `appId`: anchors are named
+  `{appId}~{runId}.{boot}.{pid}.shardN`, and the reaper only considers its own
+  app's anchors, so one application never reaps another's segments even when
+  they share a directory (the reserved `~` keeps the appId unambiguous).
 - **Deterministic schedule hooks** (`-d:shmSetScheduleHooks`): test-only seams
   at every CAS/publish site so interleavings can be driven deterministically.
 - **Portable no-op arm**: compiles everywhere; `shmSetSupported == false` off

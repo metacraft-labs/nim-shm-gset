@@ -33,7 +33,7 @@ suite "membership + idempotent inserts":
   test "insert / contains / dedup":
     let dir = freshDir("basic")
     defer: removeDir(dir)
-    var s = createSet(dir, "edge", shard0Cap = 64, shard0ArenaCap = 8192)
+    var s = createSet(dir, "io-mon", "edge", shard0Cap = 64, shard0ArenaCap = 8192)
     check s.available
     check s.insert(bytesOf("alpha")) == isInserted
     check s.insert(bytesOf("beta")) == isInserted
@@ -53,7 +53,7 @@ suite "membership + idempotent inserts":
     let dir = freshDir("shard")
     defer: removeDir(dir)
     # Tiny shard0 so growth is forced quickly (load factor 0.5 on 64 slots).
-    var s = createSet(dir, "edge", shard0Cap = 64, shard0ArenaCap = 2048)
+    var s = createSet(dir, "io-mon", "edge", shard0Cap = 64, shard0ArenaCap = 2048)
     check s.available
     var expected = initHashSet[string]()
     for i in 0 ..< 2000:
@@ -83,7 +83,7 @@ suite "position-independence (design spec §4.5(b))":
   test "a second independent mapping at a DIFFERENT base sees the same set":
     let dir = freshDir("posindep")
     defer: removeDir(dir)
-    var owner = createSet(dir, "edge", shard0Cap = 64, shard0ArenaCap = 2048)
+    var owner = createSet(dir, "io-mon", "edge", shard0Cap = 64, shard0ArenaCap = 2048)
     check owner.available
     var expected = initHashSet[string]()
     for i in 0 ..< 1500:               # force several shards
@@ -116,7 +116,7 @@ suite "multi-process oracle (zero loss / zero phantom)":
       nProc = 4
       perProc = 900         # distinct per child
       dupFactor = 8         # re-observe each element 8x (probe-storm shape)
-    var s = createSet(dir, "edge", shard0Cap = 128, shard0ArenaCap = 4096)
+    var s = createSet(dir, "io-mon", "edge", shard0Cap = 128, shard0ArenaCap = 4096)
     check s.available
     let path0 = s.path0
 
@@ -166,14 +166,14 @@ suite "reaper (cross-restart GC)":
     let dir = freshDir("reap")
     defer: removeDir(dir)
     # Live run (this process owns it).
-    var live = createSet(dir, "liveEdge", shard0Cap = 32, shard0ArenaCap = 1024)
+    var live = createSet(dir, "io-mon", "liveEdge", shard0Cap = 32, shard0ArenaCap = 1024)
     check live.available
     check live.insert(bytesOf("x")) == isInserted
 
     # Dead-owner run: fork a child that creates a set then exits; reap by pid.
     let child = fork()
     if child == 0:
-      var cs = createSet(dir, "deadEdge", shard0Cap = 32, shard0ArenaCap = 1024)
+      var cs = createSet(dir, "io-mon", "deadEdge", shard0Cap = 32, shard0ArenaCap = 1024)
       if not cs.available: quitChild(2)
       discard cs.insert(bytesOf("y"))
       # leak on purpose (no detach/unlink) then exit so its pid dies
@@ -181,14 +181,15 @@ suite "reaper (cross-restart GC)":
     var st: cint
     discard waitpid(child, st, 0)
 
-    # The dead run's shard0 exists on disk.
+    # The dead run's shard0 exists on disk (name now carries the `io-mon~` appId
+    # tag ahead of the runId).
     var deadAnchor = ""
     for _, p in walkDir(dir):
-      if extractFilename(p).startsWith("deadEdge."): deadAnchor = p
+      if extractFilename(p).startsWith("io-mon~deadEdge."): deadAnchor = p
     check deadAnchor.len > 0
     check fileExists(deadAnchor)
 
-    let reaped = reapStaleSegments(dir)
+    let reaped = reapStaleSegments(dir, "io-mon")
     check reaped >= 1
     check (not fileExists(deadAnchor))      # dead-owner chain removed
     check fileExists(live.path0)            # live-owner chain untouched
@@ -205,11 +206,60 @@ suite "reaper (cross-restart GC)":
     defer: removeDir(dir)
     let wrongBoot = bootId() + 1          # any value != the current boot-id
     let livePid = uint64(getpid())        # a pid that IS alive on this boot
-    let stalePrefix = shardBasePrefix(dir, "rebootedEdge", wrongBoot, livePid)
+    let stalePrefix = shardBasePrefix(dir, "io-mon", "rebootedEdge", wrongBoot, livePid)
     let staleAnchor = stalePrefix & ".shard0"
     writeFile(staleAnchor, "forged wrong-boot shard0")
     check fileExists(staleAnchor)
 
-    let reaped = reapStaleSegments(dir)
+    let reaped = reapStaleSegments(dir, "io-mon")
     check reaped >= 1
     check (not fileExists(staleAnchor))   # wrong-boot chain reaped despite live pid
+
+  test "cross-app isolation: a reaper only reaps its OWN appId's segments":
+    # THE KEY NEW GUARANTEE. Two DIFFERENT apps (A and B) share one segments
+    # directory. A's owner is DEAD (so a NON-scoped reaper WOULD reap it). Assert
+    # that B's reaper reaps NOTHING (A is a different appId ⇒ ignored entirely,
+    # never even liveness-checked; B itself is live), and that A's reaper reaps
+    # A's stale chain but leaves B's alone. Teeth: the pre-appId reaper —
+    # `reapStaleSegments(dir)` with no appId — would have reaped A's dead-owner
+    # chain here regardless of which app was collecting, corrupting B's peer.
+    let dir = freshDir("reapapp")
+    defer: removeDir(dir)
+
+    # App B: created and OWNED by this (live) process.
+    var bSet = createSet(dir, "appB", "runB", shard0Cap = 32, shard0ArenaCap = 1024)
+    check bSet.available
+    check bSet.insert(bytesOf("b")) == isInserted
+
+    # App A: a DEAD-owner run — fork a child that creates then exits so its pid dies.
+    let child = fork()
+    if child == 0:
+      var aSet = createSet(dir, "appA", "runA", shard0Cap = 32, shard0ArenaCap = 1024)
+      if not aSet.available: quitChild(2)
+      discard aSet.insert(bytesOf("a"))
+      quitChild(0)                          # leak on purpose; A becomes stale
+    var st: cint
+    discard waitpid(child, st, 0)
+
+    var aAnchor, bAnchor = ""
+    for _, p in walkDir(dir):
+      let n = extractFilename(p)
+      if not n.endsWith(".shard0"): continue
+      if n.startsWith("appA~"): aAnchor = p
+      elif n.startsWith("appB~"): bAnchor = p
+    check aAnchor.len > 0 and fileExists(aAnchor)
+    check bAnchor.len > 0 and fileExists(bAnchor)
+
+    # (1) B's reaper reaps NOTHING: A's dead-owner chain is a DIFFERENT appId and
+    # is ignored entirely; B's own chain is live. (Teeth: without appId scoping
+    # this would return >=1 and delete A's anchor.)
+    check reapStaleSegments(dir, "appB") == 0
+    check fileExists(aAnchor)              # A untouched by B's reaper
+    check fileExists(bAnchor)             # B (live) untouched
+
+    # (2) A's reaper reaps A's stale chain but leaves B's alone.
+    let reapedA = reapStaleSegments(dir, "appA")
+    check reapedA >= 1
+    check (not fileExists(aAnchor))       # A's stale chain removed
+    check fileExists(bAnchor)             # B still untouched
+    bSet.detach()

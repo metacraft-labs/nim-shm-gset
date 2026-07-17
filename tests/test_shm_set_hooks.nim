@@ -34,7 +34,7 @@ suite "schedule hooks":
         hitCounts.mgetOrPut(p, 0).inc)
 
     # tiny geometry so we exercise slot-claim, arena publish AND a shard link
-    var s = createSet(dir, "edge", shard0Cap = 32, shard0ArenaCap = 1024)
+    var s = createSet(dir, "io-mon", "edge", shard0Cap = 32, shard0ArenaCap = 1024)
     check s.available
     var expected = initHashSet[string]()
     for i in 0 ..< 500:

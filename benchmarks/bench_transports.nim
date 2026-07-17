@@ -109,7 +109,7 @@ proc cpuSecondsSelf(): float =
 
 proc runSet(dir, tag, label: string; shard0Cap, shard0ArenaCap: int): BenchResult =
   result.name = label
-  var s = createSet(dir, tag, shard0Cap = shard0Cap,
+  var s = createSet(dir, "bench", tag, shard0Cap = shard0Cap,
     shard0ArenaCap = shard0ArenaCap)
   doAssert s.available
   let path0 = s.path0
@@ -223,7 +223,7 @@ proc lf4SetDemo(dir: string): string =
   ## Candidate C: producers NEVER block (idempotent inserts, no backpressure), so
   ## a killed consumer cannot hang a producer. Kill the consumer mid-run; the
   ## producer keeps inserting and finishes; its data persists in the file.
-  var s = createSet(dir, "lf4set", shard0Cap = 256, shard0ArenaCap = 32 * 1024)
+  var s = createSet(dir, "bench", "lf4set", shard0Cap = 256, shard0ArenaCap = 32 * 1024)
   doAssert s.available
   let path0 = s.path0
   # A "consumer" child that just holds the map then gets killed.

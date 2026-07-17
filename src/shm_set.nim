@@ -52,6 +52,21 @@ when defined(shmSetScheduleHooks):
 
 const shmSetSupported* = defined(linux) or defined(macosx)
 
+const AppIdSep* = '~'
+  ## Reserved separator between the caller-chosen appId and the rest of an anchor
+  ## stem (`{appId}~{runId}.{boot}.{pid}`). An appId MUST NOT contain it (see
+  ## `validAppId` / `createSet`), so the reaper recovers the appId unambiguously
+  ## by splitting the stem at its FIRST occurrence — correct even when `runId`
+  ## itself contains dots or tildes. This is what lets `reapStaleSegments` scope
+  ## to ONE app and never touch (or even liveness-check) another app's segments.
+
+func validAppId*(appId: string): bool =
+  ## An appId is a filesystem-safe, separator-free tag. Reject empty, the
+  ## reserved `~` separator, and the path separator `/` (which would break the
+  ## `dir/stem` layout). Dots ARE allowed — the reserved separator makes them
+  ## unambiguous.
+  appId.len > 0 and AppIdSep notin appId and '/' notin appId
+
 func alignUp*(n, a: int): int {.inline.} = (n + a - 1) and not (a - 1)
 
 const
@@ -414,22 +429,28 @@ when shmSetSupported:
 
   # --- public API -----------------------------------------------------------
 
-  proc shardBasePrefix*(dir, runId: string; boot, ownerPid: uint64): string =
-    ## The chain's base name; `shard{K}` is appended per shard. Encodes the boot
-    ## + owner pid so the reaper can judge staleness (design spec §4.3.4).
-    dir / (runId & "." & $boot & "." & $ownerPid)
+  proc shardBasePrefix*(dir, appId, runId: string; boot, ownerPid: uint64): string =
+    ## The chain's base name; `shard{K}` is appended per shard. Encodes the
+    ## appId + runId + boot + owner pid as `dir/{appId}~{runId}.{boot}.{pid}`.
+    ## The `appId` scopes the reaper (one app never reaps another's segments);
+    ## boot + owner pid let it judge staleness (design spec §4.3.4). The reserved
+    ## `~` keeps the appId recoverable even if runId contains dots.
+    dir / (appId & AppIdSep & runId & "." & $boot & "." & $ownerPid)
 
-  proc createSet*(dir, runId: string; shard0Cap = 1024;
+  proc createSet*(dir, appId, runId: string; shard0Cap = 1024;
       shard0ArenaCap = 256 * 1024): ShmSet =
     ## CONSUMER/owner side: create shard0 (the well-known anchor) and register
     ## this process as the live consumer. Pass `path0` to producers via
-    ## `REPRO_MONITOR_DEP_SHM`. `shard0Cap` MUST be a power of two.
+    ## `REPRO_MONITOR_DEP_SHM`. `appId` tags the chain so only THIS app's reaper
+    ## considers it (see `reapStaleSegments`); it must satisfy `validAppId`.
+    ## `shard0Cap` MUST be a power of two.
     result.available = false
     result.isConsumer = true
     result.dir = dir
     result.boot = bootId()
+    if not validAppId(appId): return
     if shard0Cap <= 0 or (shard0Cap and (shard0Cap - 1)) != 0: return
-    result.basePrefix = shardBasePrefix(dir, runId, result.boot,
+    result.basePrefix = shardBasePrefix(dir, appId, runId, result.boot,
       uint64(getpid()))
     result.path0 = result.basePrefix & ".shard0"
     try:
@@ -640,14 +661,19 @@ when shmSetSupported:
     if kill(Pid(pid), cint(0)) == 0: return true
     errno != ESRCH
 
-  proc reapStaleSegments*(dir: string): int =
-    ## Cross-restart GC: remove shard files of runs whose owner is gone. For each
-    ## `{runId}.{boot}.{pid}.shard0` anchor, reap the whole chain when
-    ## boot != currentBoot (survived a reboot ⇒ pids meaningless) OR the owner
-    ## pid is dead on the current boot. A live-owner run is left alone. An
+  proc reapStaleSegments*(dir, appId: string): int =
+    ## Cross-restart GC SCOPED TO ONE appId. Only anchors tagged with `appId`
+    ## (`{appId}~{runId}.{boot}.{pid}.shard0`) are considered; segments of any
+    ## OTHER appId are IGNORED entirely — never reaped, never even
+    ## liveness-checked — so one app cannot reap another's live/crashed segments
+    ## and cross-app pid reuse can no longer misfire. WITHIN the matching appId
+    ## the staleness rule is unchanged: reap the whole chain when boot !=
+    ## currentBoot (survived a reboot ⇒ pids meaningless) OR the owner pid is
+    ## dead on the current boot. A live-owner run is left alone. An
     ## `flock(LOCK_EX|LOCK_NB)` on shard0 guards a run that is just starting.
     ## Returns the number of shard FILES removed.
     result = 0
+    if not validAppId(appId): return 0
     let cur = bootId()
     var anchors: seq[string]
     try:
@@ -656,8 +682,12 @@ when shmSetSupported:
     except CatchableError: return 0
     for anchor in anchors:
       let name = extractFilename(anchor)
-      let stem = name[0 ..< name.len - ".shard0".len]  # runId.boot.pid
-      let parts = stem.rsplit('.', 2)                  # [runId, boot, pid]
+      let stem = name[0 ..< name.len - ".shard0".len]  # appId~runId.boot.pid
+      let sep = stem.find(AppIdSep)                    # first '~' ends the appId
+      if sep < 0: continue                             # untagged / foreign anchor
+      if stem[0 ..< sep] != appId: continue            # another app: leave alone
+      let rest = stem[sep + 1 .. ^1]                   # runId.boot.pid
+      let parts = rest.rsplit('.', 2)                  # [runId, boot, pid]
       if parts.len != 3: continue
       var boot, pid: uint64
       try:
@@ -690,9 +720,9 @@ else:
       path0*: string
 
   proc bootId*(): uint64 = 1'u64
-  proc shardBasePrefix*(dir, runId: string; boot, ownerPid: uint64): string =
-    dir & "/" & runId & "." & $boot & "." & $ownerPid
-  proc createSet*(dir, runId: string; shard0Cap = 1024;
+  proc shardBasePrefix*(dir, appId, runId: string; boot, ownerPid: uint64): string =
+    dir & "/" & appId & "~" & runId & "." & $boot & "." & $ownerPid
+  proc createSet*(dir, appId, runId: string; shard0Cap = 1024;
       shard0ArenaCap = 256 * 1024): ShmSet =
     ShmSet(available: false, dir: dir)
   proc attachSet*(path0: string): ShmSet =
@@ -709,4 +739,4 @@ else:
   proc consumerAlive*(s: ShmSet): bool = false
   proc assertNoAbsolutePointers*(s: var ShmSet) = discard
   proc shards0Base*(s: ShmSet): pointer = nil
-  proc reapStaleSegments*(dir: string): int = 0
+  proc reapStaleSegments*(dir, appId: string): int = 0

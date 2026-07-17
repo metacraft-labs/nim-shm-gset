@@ -88,7 +88,7 @@ suite "position-independence via MAP_FIXED (design spec §4.5(b))":
   test "a shard mapped at a deliberately chosen base sees the identical set":
     let dir = freshDir("mapfixed")
     defer: removeDir(dir)
-    var owner = createSet(dir, "edge", shard0Cap = 64, shard0ArenaCap = 2048)
+    var owner = createSet(dir, "io-mon", "edge", shard0Cap = 64, shard0ArenaCap = 2048)
     check owner.available
     var expected = initHashSet[string]()
     for i in 0 ..< 1200:
@@ -144,7 +144,7 @@ suite "slot-claim race (design spec §4.5(c))":
     let dir = freshDir("slotrace")
     defer: removeDir(dir)
     const cap = 64
-    var host = createSet(dir, "edge", shard0Cap = cap, shard0ArenaCap = 8192)
+    var host = createSet(dir, "io-mon", "edge", shard0Cap = cap, shard0ArenaCap = 8192)
     check host.available
     gPath0 = host.path0
     let (a, b) = collidingPair(cap)
@@ -179,7 +179,7 @@ suite "double-grow (design spec §4.5(c))":
   test "two producers link a new shard concurrently; one file, no leak":
     let dir = freshDir("doublegrow")
     defer: removeDir(dir)
-    var host = createSet(dir, "edge", shard0Cap = 64, shard0ArenaCap = 16384)
+    var host = createSet(dir, "io-mon", "edge", shard0Cap = 64, shard0ArenaCap = 16384)
     check host.available
     gPath0 = host.path0
     var expected = initHashSet[string]()
@@ -226,7 +226,7 @@ suite "arena reserve/publish ordering (design spec §4.5(c))":
   test "a slot is never visible before its arena bytes are release-published":
     let dir = freshDir("arenapub")
     defer: removeDir(dir)
-    var host = createSet(dir, "edge", shard0Cap = 64, shard0ArenaCap = 8192)
+    var host = createSet(dir, "io-mon", "edge", shard0Cap = 64, shard0ArenaCap = 8192)
     check host.available
     gPath0 = host.path0
     let e = bytesOf("torn-canary-element")
@@ -263,7 +263,7 @@ suite "reaper vs starting/active run (design spec §4.5(c))":
     # as a run that is just starting / actively owning shard0 would.
     let wrongBoot = bootId() + 1
     let livePid = uint64(getpid())
-    let stalePrefix = shardBasePrefix(dir, "startingRun", wrongBoot, livePid)
+    let stalePrefix = shardBasePrefix(dir, "io-mon", "startingRun", wrongBoot, livePid)
     let staleAnchor = stalePrefix & ".shard0"
     writeFile(staleAnchor, "starting-run shard0")
     check fileExists(staleAnchor)
@@ -273,13 +273,13 @@ suite "reaper vs starting/active run (design spec §4.5(c))":
     check flock(fd, LOCK_EX) == 0        # the owner holds the lock
 
     # Reaper runs concurrently: the flock guard MUST protect the run.
-    check reapStaleSegments(dir) == 0
+    check reapStaleSegments(dir, "io-mon") == 0
     check fileExists(staleAnchor)
 
     # Once the owner releases the lock, the stale run becomes reapable.
     check flock(fd, LOCK_UN) == 0
     discard close(fd)
-    check reapStaleSegments(dir) >= 1
+    check reapStaleSegments(dir, "io-mon") >= 1
     check (not fileExists(staleAnchor))
 
 # --- (d) real multi-process SIGKILL fault injection -------------------------
@@ -300,7 +300,7 @@ proc faultInjectAt(point: SchedulePoint; victimCount: int; label: string) =
   defer: removeDir(dir)
   # Moderate shard0 so the committed producers do NOT grow; the victim forces the
   # first grow itself so it deterministically reaches the shard-link/chain-bump.
-  var host = createSet(dir, "edge", shard0Cap = 256, shard0ArenaCap = 64 * 1024)
+  var host = createSet(dir, "io-mon", "edge", shard0Cap = 256, shard0ArenaCap = 64 * 1024)
   doAssert host.available
   let path0 = host.path0
 
