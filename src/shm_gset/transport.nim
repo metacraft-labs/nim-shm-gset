@@ -17,8 +17,8 @@
 ## copies it straight into the intern arena — no codec, no heap allocation. The
 ## element key/value codec is io-mon's Layer 2/3, above this surface.
 
-import ../shm_set
-export shm_set.ShmSet   # transports may hand back the raw view when useful
+import ../shm_gset
+export shm_gset.ShmSet   # transports may hand back the raw view when useful
 
 type
   EmitStatus* = enum

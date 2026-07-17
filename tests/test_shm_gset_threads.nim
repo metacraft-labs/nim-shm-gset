@@ -1,4 +1,4 @@
-## Single-process THREAD harness for `nim-shm-set` (design spec §4.5(g)).
+## Single-process THREAD harness for `nim-shm-gset` (design spec §4.5(g)).
 ##
 ## Many threads insert DISJOINT distinct sets concurrently into the same shard
 ## chain (each thread its own mmap view; the shared state is the file-backed
@@ -14,7 +14,7 @@
 ## uniqueness fix.
 
 import std/[os, posix, sets, strutils]
-import shm_set
+import shm_gset
 
 # Geometry defaults match the historical fast functional/TSAN run. They can be
 # scaled DOWN via env for the much slower happens-before detectors (valgrind
@@ -23,9 +23,9 @@ import shm_set
 # still exercising concurrent slot-claim + grow.
 let
   nThreads = block:
-    try: max(1, parseInt(getEnv("SHM_SET_THREADS", "6"))) except ValueError: 6
+    try: max(1, parseInt(getEnv("SHM_GSET_THREADS", "6"))) except ValueError: 6
   perThread = block:
-    try: max(1, parseInt(getEnv("SHM_SET_PER_THREAD", "800"))) except ValueError: 800
+    try: max(1, parseInt(getEnv("SHM_GSET_PER_THREAD", "800"))) except ValueError: 800
 
 var gPath0: string
 
@@ -45,7 +45,7 @@ proc inserter(id: int) {.thread.} =
     s.detach()
 
 when isMainModule:
-  let dir = getTempDir() / ("shmset-threads-" & $getpid())
+  let dir = getTempDir() / ("shmgset-threads-" & $getpid())
   removeDir(dir); createDir(dir)
   # Small geometry so the many threads force real concurrent sharding.
   var host = createSet(dir, "io-mon", "edge", shard0Cap = 128, shard0ArenaCap = 8192)

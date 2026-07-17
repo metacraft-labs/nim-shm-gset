@@ -1,6 +1,6 @@
--------------------------------- MODULE shm_set --------------------------------
+-------------------------------- MODULE shm_gset --------------------------------
 (***************************************************************************)
-(* TLA+/PlusCal model of the `nim-shm-set` shared-memory G-Set protocol     *)
+(* TLA+/PlusCal model of the `nim-shm-gset` shared-memory G-Set protocol     *)
 (* (design spec io-mon-Lossless-Event-Capture §4.5(a)).                     *)
 (*                                                                          *)
 (* WHAT THIS MODELS — the LOGICAL protocol under interleaving semantics:    *)
@@ -38,7 +38,7 @@ ASSUME Cap \in Nat /\ Cap >= 1
 ASSUME MaxShards \in Nat /\ MaxShards >= 1
 ASSUME Home \in [Elements -> 0..(Cap-1)]
 
-(* --algorithm shmset {
+(* --algorithm shmgset {
   variables
     slot   = [s \in Shards |-> [i \in 0..(Cap-1) |-> 0]];   \* 0 = empty, else element
     occ    = [s \in Shards |-> 0];                          \* claimed slots per shard

@@ -8,7 +8,7 @@
 ## asserts.
 
 import std/[os, posix, sets, strutils, unittest]
-import shm_set/transport
+import shm_gset/transport
 
 proc cExit(code: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
 proc quitChild(code: cint) {.noreturn.} = cExit(code)
@@ -16,7 +16,7 @@ proc quitChild(code: cint) {.noreturn.} = cExit(code)
 var tmpCtr = 0
 proc freshDir(tag: string): string =
   inc tmpCtr
-  result = getTempDir() / ("shmset-xport-" & tag & "-" & $getpid() & "-" & $tmpCtr)
+  result = getTempDir() / ("shmgset-xport-" & tag & "-" & $getpid() & "-" & $tmpCtr)
   removeDir(result); createDir(result)
 
 proc bytesOf(s: string): seq[byte] =

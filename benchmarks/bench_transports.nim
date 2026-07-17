@@ -4,7 +4,7 @@
 ## max-contention probe-storm workload through a common producer/consumer shape,
 ## and prints the decision numbers:
 ##
-##   * Candidate C — `nim-shm-set` (sharded grow-only set, dedup at source).
+##   * Candidate C — `nim-shm-gset` (sharded grow-only set, dedup at source).
 ##   * Candidate A — `nim-shm-queue` ring with the `opBlockProducer` policy
 ##     (lossless block-on-full ring; consumer drains continuously).
 ##
@@ -25,7 +25,7 @@
 
 import std/[os, posix, sets, sequtils, monotimes, times, algorithm,
   strutils, strformat]
-import shm_set
+import shm_gset
 import shm_queue/ring as ring
 
 proc cExit(code: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
@@ -105,7 +105,7 @@ proc cpuSecondsSelf(): float =
   float(ru.ru_utime.tv_sec) + float(ru.ru_utime.tv_usec) / 1e6 +
     float(ru.ru_stime.tv_sec) + float(ru.ru_stime.tv_usec) / 1e6
 
-# --- Candidate C: nim-shm-set ---------------------------------------------
+# --- Candidate C: nim-shm-gset ---------------------------------------------
 
 proc runSet(dir, tag, label: string; shard0Cap, shard0ArenaCap: int): BenchResult =
   result.name = label
@@ -305,19 +305,19 @@ proc row(r: BenchResult) =
   echo &"    zero-loss/phantom  : {(not r.lossOrPhantom)}"
 
 when isMainModule:
-  let dir = getTempDir() / ("shmset-bench-" & $getpid())
+  let dir = getTempDir() / ("shmgset-bench-" & $getpid())
   removeDir(dir); createDir(dir)
   echo "io-mon Lossless Event Capture — M1 transport benchmark"
   echo &"workload: {nProc} producers x {D} distinct x {rounds} rounds = " &
     &"{totalEvents} events, dedup ratio {totalEvents div D}x"
   echo ""
   # Candidate C, growing by sharding (small shard0 -> several shard-appends).
-  let setRes = runSet(dir, "sharded", "C: nim-shm-set (sharded G-Set)",
+  let setRes = runSet(dir, "sharded", "C: nim-shm-gset (sharded G-Set)",
     shard0Cap = 1024, shard0ArenaCap = 128 * 1024)
   # Candidate C size-once baseline: shard0 pre-sized past the distinct count so
   # it NEVER shards — isolates the per-insert cost from the sharding overhead.
   let setOnce = runSet(dir, "sizeonce",
-    "C': nim-shm-set (size-once, no growth)",
+    "C': nim-shm-gset (size-once, no growth)",
     shard0Cap = 16384, shard0ArenaCap = 4 * 1024 * 1024)
   let ringRes = runRing(dir)
   row(setRes); echo ""
@@ -327,23 +327,23 @@ when isMainModule:
     (not setRes.lossOrPhantom) and (not setOnce.lossOrPhantom) and
     (not ringRes.lossOrPhantom)
   # CORRECTNESS is asserted, not merely printed: the authoritative asserting
-  # proofs live in the unit tests (tests/test_shm_set.nim multi-process oracle;
+  # proofs live in the unit tests (tests/test_shm_gset.nim multi-process oracle;
   # nim-shm-queue tests/test_ring_block_producer.nim for A). These doAsserts are
   # a SECONDARY guard so a zero-loss/phantom or LF-4 regression FAILS the bench
   # LOUDLY (non-zero exit) instead of silently printing `false`/`FAIL`. The
   # measurement numbers above stay echo-only; only the correctness verdicts here
   # become assertions.
   doAssert not setRes.lossOrPhantom,
-    "C: nim-shm-set (sharded G-Set): zero-loss/phantom oracle regressed"
+    "C: nim-shm-gset (sharded G-Set): zero-loss/phantom oracle regressed"
   doAssert not setOnce.lossOrPhantom,
-    "C': nim-shm-set (size-once): zero-loss/phantom oracle regressed"
+    "C': nim-shm-gset (size-once): zero-loss/phantom oracle regressed"
   doAssert not ringRes.lossOrPhantom,
     "A: nim-shm-queue ring (opBlockProducer): zero-loss/phantom oracle regressed"
   echo "LF-4 killed-consumer:"
   let lf4Set = lf4SetDemo(dir)
   echo "  ", lf4Set
   doAssert lf4Set.startsWith("PASS"),
-    "C: nim-shm-set LF-4 regressed (killed consumer must not hang a producer): " &
+    "C: nim-shm-gset LF-4 regressed (killed consumer must not hang a producer): " &
     lf4Set
   let lf4Ring = lf4RingDemo(dir)
   echo "  ", lf4Ring

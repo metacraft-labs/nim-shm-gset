@@ -4,12 +4,12 @@
 ## asserts `snapshot == union(intended)` (zero loss, zero phantom) and
 ## `growthFailures == 0`.
 ##
-## Duration via `SHM_SET_SOAK_SECONDS` (default 2.0s, kept short so `just test`
+## Duration via `SHM_GSET_SOAK_SECONDS` (default 2.0s, kept short so `just test`
 ## stays fast). The MULTI-HOUR soak and `rr`-chaos mode on x86 AND ARM64 are a
 ## CI / M2-part-2 concern (see the milestone status).
 
 import std/[os, posix, sets, strutils, times]
-import shm_set
+import shm_gset
 
 proc cExit(code: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
 proc quitChild(code: cint) {.noreturn.} = cExit(code)
@@ -23,12 +23,12 @@ proc strOf(b: seq[byte]): string =
   for i in 0 ..< b.len: result[i] = char(b[i])
 
 when isMainModule:
-  let soakSecs = try: parseFloat(getEnv("SHM_SET_SOAK_SECONDS", "2.0"))
+  let soakSecs = try: parseFloat(getEnv("SHM_GSET_SOAK_SECONDS", "2.0"))
                  except ValueError: 2.0
   const
     nProc = 6
     perProc = 1200        ## distinct per producer
-  let dir = getTempDir() / ("shmset-soak-" & $getpid())
+  let dir = getTempDir() / ("shmgset-soak-" & $getpid())
   removeDir(dir); createDir(dir)
   # Tiny shards ⇒ maximal sharding / constant concurrent growth (§4.5(d)).
   var host = createSet(dir, "io-mon", "edge", shard0Cap = 16, shard0ArenaCap = 512)

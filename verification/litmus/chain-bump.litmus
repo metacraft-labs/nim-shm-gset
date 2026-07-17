@@ -1,6 +1,6 @@
 C chain-bump
 (*
- * nim-shm-set chain-count publish (src/shm_set.nim `bumpChainCountTo` ->
+ * nim-shm-gset chain-count publish (src/shm_gset.nim `bumpChainCountTo` ->
  * `chainCount`/`insert`), design spec §4.5(a).
  *
  * After a new shard is linked, a producer bumps shard0's chainCount with a

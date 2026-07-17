@@ -1,6 +1,6 @@
 C header-magic
 (*
- * nim-shm-set shard-header publish (src/shm_set.nim `initShardHeader` ->
+ * nim-shm-gset shard-header publish (src/shm_gset.nim `initShardHeader` ->
  * `headerValid`/`mapShardFromFd`), design spec §4.5(a).
  *
  * initShardHeader writes every header field (capacity, slotsOff, arenaOff, ...)

@@ -1,4 +1,4 @@
-# nim-shm-set test + benchmark runner.
+# nim-shm-gset test + benchmark runner.
 #
 # `nimble test` also works, but only once the repo has at least one commit
 # (nimble derives the package version from the VCS revision). This `just`
@@ -9,13 +9,13 @@ nim_flags := "--hints:off --threads:on --warning:BareExcept:off --path:src"
 # Build + run the full functional + concurrency-verification suite (design spec
 # §4.5). x86-64 Linux. Deterministic — no flaky stress in `test`.
 test:
-    nim c -r {{nim_flags}} tests/test_shm_set.nim
-    nim c -r {{nim_flags}} tests/test_shm_set_transport.nim
-    nim c -r {{nim_flags}} tests/test_shm_set_lf5.nim
-    nim c -r {{nim_flags}} -d:shmSetScheduleHooks tests/test_shm_set_hooks.nim
-    nim c -r {{nim_flags}} -d:shmSetScheduleHooks tests/test_shm_set_concurrency.nim
-    nim c -r {{nim_flags}} tests/test_shm_set_threads.nim
-    nim c -r {{nim_flags}} tests/test_shm_set_soak.nim
+    nim c -r {{nim_flags}} tests/test_shm_gset.nim
+    nim c -r {{nim_flags}} tests/test_shm_gset_transport.nim
+    nim c -r {{nim_flags}} tests/test_shm_gset_lf5.nim
+    nim c -r {{nim_flags}} -d:shmSetScheduleHooks tests/test_shm_gset_hooks.nim
+    nim c -r {{nim_flags}} -d:shmSetScheduleHooks tests/test_shm_gset_concurrency.nim
+    nim c -r {{nim_flags}} tests/test_shm_gset_threads.nim
+    nim c -r {{nim_flags}} tests/test_shm_gset_soak.nim
 
 # Sanitizers (design spec §4.5(g)) — TSAN + ASan/UBSan over the single-process
 # thread harness (the algorithm's memory ordering; TSAN does NOT cross the
@@ -26,20 +26,20 @@ test:
 test-sanitizers:
     nim c {{nim_flags}} --mm:orc -d:useMalloc --debugger:native \
         --passc:-fsanitize=thread --passl:-fsanitize=thread \
-        -o:/tmp/shmset-tsan-threads tests/test_shm_set_threads.nim
-    TSAN_OPTIONS="halt_on_error=1" /tmp/shmset-tsan-threads
+        -o:/tmp/shmgset-tsan-threads tests/test_shm_gset_threads.nim
+    TSAN_OPTIONS="halt_on_error=1" /tmp/shmgset-tsan-threads
     nim c {{nim_flags}} --mm:orc -d:useMalloc --debugger:native \
         --passc:"-fsanitize=address,undefined -fno-sanitize-recover=undefined" \
         --passl:"-fsanitize=address,undefined" \
-        -o:/tmp/shmset-asan-threads tests/test_shm_set_threads.nim
-    ASAN_OPTIONS="detect_leaks=0" /tmp/shmset-asan-threads
+        -o:/tmp/shmgset-asan-threads tests/test_shm_gset_threads.nim
+    ASAN_OPTIONS="detect_leaks=0" /tmp/shmgset-asan-threads
 
 # Longer parameterizable many-process soak (design spec §4.5(f)). The default in
 # `test` is a short 2s; use this for a longer bounded run, e.g. `just soak 300`.
 # The multi-HOUR version (hours, on x86 AND ARM64) is a CI concern; this target is
 # the same harness, just run longer.
 soak seconds="60":
-    SHM_SET_SOAK_SECONDS={{seconds}} nim c -r {{nim_flags}} tests/test_shm_set_soak.nim
+    SHM_GSET_SOAK_SECONDS={{seconds}} nim c -r {{nim_flags}} tests/test_shm_gset_soak.nim
 
 # Valgrind DRD + helgrind (design spec §4.5(g)) — a SECOND, happens-before race
 # detector alongside TSAN, over the single-process thread harness (the SAME
@@ -54,27 +54,27 @@ soak seconds="60":
 # Both tools run clean (0 errors), so no suppression file is needed.
 test-valgrind:
     nim c {{nim_flags}} --mm:orc -d:useMalloc --debugger:native \
-        -o:/tmp/shmset-vg-threads tests/test_shm_set_threads.nim
-    SHM_SET_THREADS=3 SHM_SET_PER_THREAD=200 \
-        valgrind --tool=helgrind --error-exitcode=99 /tmp/shmset-vg-threads
-    SHM_SET_THREADS=3 SHM_SET_PER_THREAD=200 \
-        valgrind --tool=drd --error-exitcode=99 /tmp/shmset-vg-threads
+        -o:/tmp/shmgset-vg-threads tests/test_shm_gset_threads.nim
+    SHM_GSET_THREADS=3 SHM_GSET_PER_THREAD=200 \
+        valgrind --tool=helgrind --error-exitcode=99 /tmp/shmgset-vg-threads
+    SHM_GSET_THREADS=3 SHM_GSET_PER_THREAD=200 \
+        valgrind --tool=drd --error-exitcode=99 /tmp/shmgset-vg-threads
 
 # TLA+/TLC model check of the protocol (design spec §4.5(a)). TLC is not in the
 # dev shell, so this target pulls it from nixpkgs on demand. The PlusCal
 # algorithm is already translated (the BEGIN/END TRANSLATION block in
-# shm_set.tla); after editing the PlusCal, re-translate with `pcal shm_set.tla`.
+# shm_gset.tla); after editing the PlusCal, re-translate with `pcal shm_gset.tla`.
 # Proves LOGICAL protocol safety under interleavings; weak-memory sufficiency is
 # the litmus/GenMC job (verification/litmus, verification/core).
 verify-tla:
     cd verification/tla && nix shell nixpkgs#tlaplus --command \
-        tlc -config shm_set_MC.cfg shm_set_MC.tla
+        tlc -config shm_gset_MC.cfg shm_gset_MC.tla
 
 # rr chaos-mode record + deterministic replay of the multi-process fork oracle
 # (design spec §4.5(f)). Explores rare fork/grow interleavings under a randomised
 # scheduler; every recording asserts `snapshot == union(intended)`. rr needs a HW
 # CPU-cycle counter; on Intel hybrid parts pass RR_BIND_CPU to pin a P-core (the
-# script defaults to cpu0). Tune with RR_CHAOS_ITERS / SHM_SET_SOAK_SECONDS.
+# script defaults to cpu0). Tune with RR_CHAOS_ITERS / SHM_GSET_SOAK_SECONDS.
 test-rr:
     bash verification/run-rr-chaos.sh
 

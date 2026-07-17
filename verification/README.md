@@ -1,7 +1,7 @@
-# nim-shm-set — formal / weak-memory verification tier (design spec §4.5)
+# nim-shm-gset — formal / weak-memory verification tier (design spec §4.5)
 
 This directory is the **formal and weak-memory** verification tier for the
-lock-free, multi-process, file-backed G-Set in `../src/shm_set.nim`. It is the
+lock-free, multi-process, file-backed G-Set in `../src/shm_gset.nim`. It is the
 part-2 complement to the *dynamic* verification that lives in `../tests` (schedule
 -hook interleavings, fork+SIGKILL fault injection, TSAN/ASan/UBSan, the LF-5 and
 position-independence tests) and is wired through the `../Justfile`.
@@ -60,7 +60,7 @@ nix eval nixpkgs#cdschecker.name   -> does not exist
 | Artifact | Tool needed | How to run once present |
 |---|---|---|
 | `litmus/*.litmus` (5 shipped-ordering + 1 relaxed control) | herd7 (`herdtools7`) | `nix shell nixpkgs#herdtools7 --command litmus/run-litmus.sh` |
-| `core/shm_set_core.c` under a stateless model checker | GenMC / Nidhugg / CDSChecker | `nix shell nixpkgs#genmc --command genmc -- -unroll=3 core/shm_set_core.c` (or `nidhugg --c11 --unroll=3 …`) |
+| `core/shm_gset_core.c` under a stateless model checker | GenMC / Nidhugg / CDSChecker | `nix shell nixpkgs#genmc --command genmc -- -unroll=3 core/shm_gset_core.c` (or `nidhugg --c11 --unroll=3 …`) |
 
 The litmus tests encode, per hardware model (x86-TSO, ARMv8, RISC-V), the exact
 release→acquire message-passing shape of every publish pair: slot publish, arena
@@ -69,7 +69,7 @@ release→acquire message-passing shape of every publish pair: slot publish, are
 must be **Allowed** on a weak model, which is what proves the shipped ordering is
 load-bearing (the "passes on x86, faults on ARM" trap).
 
-The C11 core (`core/shm_set_core.c`) is the **same memory orders** the Nim
+The C11 core (`core/shm_gset_core.c`) is the **same memory orders** the Nim
 library uses (`memory_order_release` slot CAS, `seq_cst` arena bump, `acq_rel`
 chain-bump, `acquire` reader loads) on a tiny forced-collision table with two
 producers — the compilation unit a model checker drives, matching the shipped
@@ -77,9 +77,9 @@ algorithm rather than paraphrasing it.
 
 ## Files
 
-- `tla/shm_set.tla` — PlusCal model + embedded TLA+ translation + invariants.
-- `tla/shm_set_MC.{tla,cfg}` — the finite TLC instance (3 elements, 2-slot shard,
+- `tla/shm_gset.tla` — PlusCal model + embedded TLA+ translation + invariants.
+- `tla/shm_gset_MC.{tla,cfg}` — the finite TLC instance (3 elements, 2-slot shard,
   forced grow) and its config.
 - `litmus/*.litmus` — herd7 litmus tests (+ `run-litmus.sh`).
-- `core/shm_set_core.c` — extracted C11 atomics core (+ `build-aarch64-qemu.sh`).
+- `core/shm_gset_core.c` — extracted C11 atomics core (+ `build-aarch64-qemu.sh`).
 - `run-rr-chaos.sh` — rr chaos record/replay driver (used by `just test-rr`).

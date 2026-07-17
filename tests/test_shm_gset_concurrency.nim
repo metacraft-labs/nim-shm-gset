@@ -1,4 +1,4 @@
-## Deterministic concurrency verification for `nim-shm-set` (design spec §4.5).
+## Deterministic concurrency verification for `nim-shm-gset` (design spec §4.5).
 ## Built with `-d:shmSetScheduleHooks --threads:on`. Every window below is driven
 ## to a SPECIFIC interleaving via the schedule hooks (barrier + release), so these
 ## are DETERMINISTIC regression tests, not flaky stress. x86-64 Linux.
@@ -12,7 +12,7 @@
 ##           point; the single-threaded reader's union stays correct.
 
 import std/[os, posix, sets, strutils, tables, times, unittest, atomics]
-import shm_set
+import shm_gset
 
 static: doAssert scheduleHooksEnabled, "expected -d:shmSetScheduleHooks"
 
@@ -25,7 +25,7 @@ const LOCK_UN = cint(8)
 var tmpCtr = 0
 proc freshDir(tag: string): string =
   inc tmpCtr
-  result = getTempDir() / ("shmset-cc-" & tag & "-" & $getpid() & "-" & $tmpCtr)
+  result = getTempDir() / ("shmgset-cc-" & tag & "-" & $getpid() & "-" & $tmpCtr)
   removeDir(result); createDir(result)
 
 proc bytesOf(s: string): seq[byte] =

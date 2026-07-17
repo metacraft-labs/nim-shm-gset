@@ -1,4 +1,4 @@
-# nim-shm-set
+# nim-shm-gset
 
 A shared-memory, lock-free, **grow-only set (G-Set)** for Nim — the Candidate-C
 transport of the *io-mon Lossless Event Capture* campaign
@@ -56,7 +56,7 @@ regardless of write order, writer, or duplication.
 ## API sketch
 
 ```nim
-import shm_set
+import shm_gset
 
 # CONSUMER (owner): create shard0, register liveness, get the well-known path.
 var s = createSet(dir, runId)          # shard0Cap / shard0ArenaCap optional

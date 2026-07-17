@@ -11,12 +11,12 @@
 ##      real "the OS refused to create the shard file" case.
 
 import std/[os, posix, sets, strutils, unittest]
-import shm_set
+import shm_gset
 
 var tmpCtr = 0
 proc freshDir(tag: string): string =
   inc tmpCtr
-  result = getTempDir() / ("shmset-lf5-" & tag & "-" & $getpid() & "-" & $tmpCtr)
+  result = getTempDir() / ("shmgset-lf5-" & tag & "-" & $getpid() & "-" & $tmpCtr)
   removeDir(result); createDir(result)
 
 proc bytesOf(s: string): seq[byte] =

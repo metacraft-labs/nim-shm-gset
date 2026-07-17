@@ -1,4 +1,4 @@
-## `nim-shm-set` — a shared-memory, lock-free, grow-only SET (G-Set).
+## `nim-shm-gset` — a shared-memory, lock-free, grow-only SET (G-Set).
 ##
 ## Domain-free (like `nim-shm-queue` Layer 1): the element is an opaque byte
 ## blob; io-mon (or any consumer) supplies the encoding. This library knows only
@@ -38,14 +38,14 @@
 ## bytes; a slot references its record by offset. No hot-path heap allocation on
 ## insert (the caller supplies the blob; the record is memcpy'd into the arena).
 ##
-## Deterministic SCHEDULE HOOKS (`shm_set/hooks`, test-only `-d:shmSetScheduleHooks`)
+## Deterministic SCHEDULE HOOKS (`shm_gset/hooks`, test-only `-d:shmSetScheduleHooks`)
 ## seam every CAS/publish site so M2 can drive interleavings without a retrofit.
 ##
 ## Portability: Linux + macOS (POSIX `mmap` MAP_SHARED). On any other platform
 ## `shmSetSupported` is false and every op reports unavailable (`supported=false`
 ## arm), so a caller degrades gracefully.
 
-import ./shm_set/hooks
+import ./shm_gset/hooks
 export hooks.SchedulePoint, hooks.scheduleHooksEnabled
 when defined(shmSetScheduleHooks):
   export hooks.setScheduleHook, hooks.ScheduleHook
@@ -70,7 +70,7 @@ func validAppId*(appId: string): bool =
 func alignUp*(n, a: int): int {.inline.} = (n + a - 1) and not (a - 1)
 
 const
-  ShmSetMagic* = 0x5347_4D48_53_00_01'u64  ## "SHM SG" — shm_set shard magic.
+  ShmSetMagic* = 0x5347_4D48_53_00_01'u64  ## "SHM SG" — shm_gset shard magic.
   ShmSetFormatVersion* = 1'u32
 
 # --- shard file header (offset-only, base-independent) ----------------------

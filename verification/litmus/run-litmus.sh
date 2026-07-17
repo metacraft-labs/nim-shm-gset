@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run every nim-shm-set litmus test under herd7 for each hardware memory model
+# Run every nim-shm-gset litmus test under herd7 for each hardware memory model
 # (design spec §4.5(a)). herd7 (herdtools7) is NOT in this repo's dev shell/pin,
 # so this is the blessed way to run the authored tests once the tool is present:
 #

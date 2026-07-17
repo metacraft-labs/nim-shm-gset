@@ -1,4 +1,4 @@
-## Functional + concurrency suite for `nim-shm-set` (Candidate C).
+## Functional + concurrency suite for `nim-shm-gset` (Candidate C).
 ##
 ## Covers: idempotent membership, dedup-at-source, growth by SHARDING (never
 ## drop), the single-threaded union/merge, position-independence ACROSS PROCESS
@@ -7,7 +7,7 @@
 ## growth-failure, and the cross-restart reaper.
 
 import std/[os, posix, sets, strutils, unittest]
-import shm_set
+import shm_gset
 
 proc cExit(code: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
 proc quitChild(code: cint) {.noreturn.} = cExit(code)
@@ -15,7 +15,7 @@ proc quitChild(code: cint) {.noreturn.} = cExit(code)
 var tmpCtr = 0
 proc freshDir(tag: string): string =
   inc tmpCtr
-  result = getTempDir() / ("shmset-" & tag & "-" & $getpid() & "-" & $tmpCtr)
+  result = getTempDir() / ("shmgset-" & tag & "-" & $getpid() & "-" & $tmpCtr)
   removeDir(result)
   createDir(result)
 

@@ -1,7 +1,7 @@
 /*
- * shm_set_core.c — the extracted C11 atomics core of nim-shm-set, for stateless
+ * shm_gset_core.c — the extracted C11 atomics core of nim-shm-gset, for stateless
  * model checking under weak memory (design spec io-mon-Lossless-Event-Capture
- * §4.5(a)). It reproduces, with the SAME memory orders as src/shm_set.nim, the
+ * §4.5(a)). It reproduces, with the SAME memory orders as src/shm_gset.nim, the
  * four load-bearing atomic sites on a deliberately tiny forced-collision table:
  *
  *   1. slot-claim       CAS 0 -> arena-offset, ACQ_REL      (insertIntoShard)
@@ -25,14 +25,14 @@
  *
  * HOW TO MODEL-CHECK (tools NOT in this repo's pin — author-not-run here; see
  * verification/README.md for the exact failing `nix` attempts):
- *   GenMC:      nix shell nixpkgs#genmc  --command genmc -- -unroll=3 shm_set_core.c
- *   Nidhugg:    nidhugg --c11 --unroll=3 shm_set_core.c
+ *   GenMC:      nix shell nixpkgs#genmc  --command genmc -- -unroll=3 shm_gset_core.c
+ *   Nidhugg:    nidhugg --c11 --unroll=3 shm_gset_core.c
  *   CDSChecker: compile with -DCDSCHECKER against its model API (see README).
  *
  * It also builds+runs natively as a FUNCTIONAL smoke (many random schedules) —
  * that is NOT a weak-memory proof (a native run cannot exhaustively reorder);
  * it only proves the core compiles and its logic is self-consistent. Build:
- *   cc -std=c11 -O2 -pthread -DSTANDALONE shm_set_core.c -o shm_set_core_run
+ *   cc -std=c11 -O2 -pthread -DSTANDALONE shm_gset_core.c -o shm_gset_core_run
  */
 #include <stdatomic.h>
 #include <stdint.h>
@@ -199,7 +199,7 @@ int main(void)
 {
     /* Functional smoke ONLY (not a weak-memory proof): hammer many schedules. */
     for (long i = 0; i < (long)NITER; i++) run_once();
-    printf("[OK] shm_set_core functional smoke: %ld slot-claim races, "
+    printf("[OK] shm_gset_core functional smoke: %ld slot-claim races, "
            "no torn read / loss / phantom (NOT a weak-memory proof)\n", (long)NITER);
     return 0;
 }

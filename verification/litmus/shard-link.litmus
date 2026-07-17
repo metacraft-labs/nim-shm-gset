@@ -1,6 +1,6 @@
 C shard-link
 (*
- * nim-shm-set shard-append publish (src/shm_set.nim `appendShardFile`), design
+ * nim-shm-gset shard-append publish (src/shm_gset.nim `appendShardFile`), design
  * spec §4.5(a) / §4.3.1 "publish-before-write".
  *
  * A new shard is FULLY initialised (its header magic release-stored) and its

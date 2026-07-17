@@ -9,11 +9,11 @@ skipDirs      = @["tests", "benchmarks"]
 
 requires "nim >= 2.0.0"
 
-task test, "Build + run the nim-shm-set test suite":
+task test, "Build + run the nim-shm-gset test suite":
   # Functional + concurrency (multi-process fork) suite for the sharded G-Set.
   exec "nim c -r --hints:off --threads:on --warning:BareExcept:off " &
-    "tests/test_shm_set.nim"
+    "tests/test_shm_gset.nim"
   # The same suite compiled with the deterministic schedule hooks enabled, to
   # prove the test-only seams compile and stay behaviour-preserving.
   exec "nim c -r --hints:off --threads:on --warning:BareExcept:off " &
-    "-d:shmSetScheduleHooks tests/test_shm_set_hooks.nim"
+    "-d:shmSetScheduleHooks tests/test_shm_gset_hooks.nim"

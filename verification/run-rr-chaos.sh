@@ -19,24 +19,24 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/.." && pwd)"
 bind_cpu="${RR_BIND_CPU:-0}"
 iters="${RR_CHAOS_ITERS:-5}"
-soak_secs="${SHM_SET_SOAK_SECONDS:-1}"
+soak_secs="${SHM_GSET_SOAK_SECONDS:-1}"
 nim_flags="--hints:off --threads:on --warning:BareExcept:off --path:$root/src"
 
-bin="$(mktemp -u /tmp/shmset-rr-soak.XXXXXX)"
-trace_dir="$(mktemp -d /tmp/shmset-rr-trace.XXXXXX)"
+bin="$(mktemp -u /tmp/shmgset-rr-soak.XXXXXX)"
+trace_dir="$(mktemp -d /tmp/shmgset-rr-trace.XXXXXX)"
 export _RR_TRACE_DIR="$trace_dir"
 cleanup() { rm -rf "$trace_dir" "$bin"; }
 trap cleanup EXIT
 
 echo "== building fork-oracle soak harness =="
-if ! nim c $nim_flags -o:"$bin" "$root/tests/test_shm_set_soak.nim"; then
+if ! nim c $nim_flags -o:"$bin" "$root/tests/test_shm_gset_soak.nim"; then
   echo "FAIL: nim build failed" >&2; exit 1
 fi
 
-echo "== rr chaos record x$iters (SHM_SET_SOAK_SECONDS=$soak_secs, cpu=$bind_cpu) =="
+echo "== rr chaos record x$iters (SHM_GSET_SOAK_SECONDS=$soak_secs, cpu=$bind_cpu) =="
 for i in $(seq 1 "$iters"); do
   echo "-- chaos record iteration $i --"
-  out="$(SHM_SET_SOAK_SECONDS="$soak_secs" \
+  out="$(SHM_GSET_SOAK_SECONDS="$soak_secs" \
     rr record -h --bind-to-cpu="$bind_cpu" -o "$trace_dir/trace$i" "$bin" 2>&1)"
   rc=$?
   echo "$out" | grep -E "OK|soak|Assert|Error|FAIL" || true

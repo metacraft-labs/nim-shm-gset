@@ -4,14 +4,14 @@
 ## scaffolding M2's adversarial-interleaving tests build on (M1 exit criteria).
 
 import std/[os, posix, sets, tables, unittest]
-import shm_set
+import shm_gset
 
 static: doAssert scheduleHooksEnabled, "expected -d:shmSetScheduleHooks"
 
 var tmpCtr = 0
 proc freshDir(tag: string): string =
   inc tmpCtr
-  result = getTempDir() / ("shmset-hk-" & tag & "-" & $getpid() & "-" & $tmpCtr)
+  result = getTempDir() / ("shmgset-hk-" & tag & "-" & $getpid() & "-" & $tmpCtr)
   removeDir(result); createDir(result)
 
 proc bytesOf(s: string): seq[byte] =

@@ -14,7 +14,7 @@
 set -uo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cc=aarch64-unknown-linux-gnu-gcc
-out=/tmp/shm_set_core_aarch64
+out=/tmp/shm_gset_core_aarch64
 iters="${NITER:-2000}"
 
 if ! command -v "$cc" >/dev/null 2>&1; then
@@ -22,8 +22,8 @@ if ! command -v "$cc" >/dev/null 2>&1; then
   exit 127
 fi
 
-echo "== cross-compiling shm_set_core for aarch64 (dynamic) =="
-"$cc" -std=c11 -O2 -pthread -DSTANDALONE -DNITER="$iters" "$here/shm_set_core.c" -o "$out"
+echo "== cross-compiling shm_gset_core for aarch64 (dynamic) =="
+"$cc" -std=c11 -O2 -pthread -DSTANDALONE -DNITER="$iters" "$here/shm_gset_core.c" -o "$out"
 file "$out" | head -1
 
 glibc="$(dirname "$(dirname "$("$cc" -print-file-name=libc.so.6)")")"

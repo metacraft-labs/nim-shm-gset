@@ -1,4 +1,4 @@
-## Deterministic schedule-hook seams for `nim-shm-set` (design spec §4.5(c)).
+## Deterministic schedule-hook seams for `nim-shm-gset` (design spec §4.5(c)).
 ##
 ## Every concurrency-sensitive site in the set (slot-claim CAS, arena-offset
 ## publish, shard-link publish, chain-count bump) calls `scheduleHook(point)`.

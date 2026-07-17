@@ -1,6 +1,6 @@
 C arena-offset-follow
 (*
- * nim-shm-set arena-offset publish->follow (design spec §4.5(a)). The slot does
+ * nim-shm-gset arena-offset publish->follow (design spec §4.5(a)). The slot does
  * not hold the record inline; it holds an OFFSET, and the reader must FOLLOW it
  * to two separate record fields (fp at +0, len at +8) written before publish.
  * This pins that an ACQUIRE load on the slot (not merely a data/consume

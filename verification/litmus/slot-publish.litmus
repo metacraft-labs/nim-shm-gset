@@ -1,6 +1,6 @@
 C slot-publish
 (*
- * nim-shm-set slot-claim publish (src/shm_set.nim `insertIntoShard` ->
+ * nim-shm-gset slot-claim publish (src/shm_gset.nim `insertIntoShard` ->
  * reader/`entryMatches`), design spec io-mon-Lossless-Event-Capture §4.5(a).
  *
  * The SHIPPED release->acquire pair:
