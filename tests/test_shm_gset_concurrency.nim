@@ -1,5 +1,5 @@
 ## Deterministic concurrency verification for `nim-shm-gset` (design spec §4.5).
-## Built with `-d:shmSetScheduleHooks --threads:on`. Every window below is driven
+## Built with `-d:shmGSetScheduleHooks --threads:on`. Every window below is driven
 ## to a SPECIFIC interleaving via the schedule hooks (barrier + release), so these
 ## are DETERMINISTIC regression tests, not flaky stress. x86-64 Linux.
 ##
@@ -14,7 +14,7 @@
 import std/[os, posix, sets, strutils, tables, times, unittest, atomics]
 import shm_gset
 
-static: doAssert scheduleHooksEnabled, "expected -d:shmSetScheduleHooks"
+static: doAssert scheduleHooksEnabled, "expected -d:shmGSetScheduleHooks"
 
 proc cExit(code: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
 proc quitChild(code: cint) {.noreturn.} = cExit(code)

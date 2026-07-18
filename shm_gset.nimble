@@ -16,4 +16,4 @@ task test, "Build + run the nim-shm-gset test suite":
   # The same suite compiled with the deterministic schedule hooks enabled, to
   # prove the test-only seams compile and stay behaviour-preserving.
   exec "nim c -r --hints:off --threads:on --warning:BareExcept:off " &
-    "-d:shmSetScheduleHooks tests/test_shm_gset_hooks.nim"
+    "-d:shmGSetScheduleHooks tests/test_shm_gset_hooks.nim"

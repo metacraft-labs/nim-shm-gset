@@ -48,9 +48,9 @@ regardless of write order, writer, or duplication.
   `{appId}~{runId}.{boot}.{pid}.shardN`, and the reaper only considers its own
   app's anchors, so one application never reaps another's segments even when
   they share a directory (the reserved `~` keeps the appId unambiguous).
-- **Deterministic schedule hooks** (`-d:shmSetScheduleHooks`): test-only seams
+- **Deterministic schedule hooks** (`-d:shmGSetScheduleHooks`): test-only seams
   at every CAS/publish site so interleavings can be driven deterministically.
-- **Portable no-op arm**: compiles everywhere; `shmSetSupported == false` off
+- **Portable no-op arm**: compiles everywhere; `shmGSetSupported == false` off
   Linux/macOS, where every op reports unavailable.
 
 ## API sketch

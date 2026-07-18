@@ -1,12 +1,12 @@
 ## Compiles the set WITH the deterministic schedule hooks enabled
-## (`-d:shmSetScheduleHooks`) and proves (a) the seams fire at the documented
+## (`-d:shmGSetScheduleHooks`) and proves (a) the seams fire at the documented
 ## points and (b) installing a hook does not change the observable result — the
 ## scaffolding M2's adversarial-interleaving tests build on (M1 exit criteria).
 
 import std/[os, posix, sets, tables, unittest]
 import shm_gset
 
-static: doAssert scheduleHooksEnabled, "expected -d:shmSetScheduleHooks"
+static: doAssert scheduleHooksEnabled, "expected -d:shmGSetScheduleHooks"
 
 var tmpCtr = 0
 proc freshDir(tag: string): string =

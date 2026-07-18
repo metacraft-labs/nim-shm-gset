@@ -3,7 +3,7 @@
 ## Every concurrency-sensitive site in the set (slot-claim CAS, arena-offset
 ## publish, shard-link publish, chain-count bump) calls `scheduleHook(point)`.
 ## In a normal build the hook is a **compile-time no-op** (the call folds away),
-## so it costs nothing on the hot path. Under `-d:shmSetScheduleHooks` a test can
+## so it costs nothing on the hot path. Under `-d:shmGSetScheduleHooks` a test can
 ## install a callback that yields / sleeps / coordinates at a chosen point to
 ## drive a specific interleaving deterministically — this is the scaffolding M2's
 ## adversarial-interleaving regression tests build on, landed here so the
@@ -30,12 +30,12 @@ type
 
   ScheduleHook* = proc (point: SchedulePoint) {.gcsafe, raises: [].}
 
-when defined(shmSetScheduleHooks):
+when defined(shmGSetScheduleHooks):
   var activeHook {.threadvar.}: ScheduleHook
 
   proc setScheduleHook*(h: ScheduleHook) =
     ## Install (or clear, with `nil`) the current thread's schedule hook. Only
-    ## available under `-d:shmSetScheduleHooks`.
+    ## available under `-d:shmGSetScheduleHooks`.
     activeHook = h
 
   proc scheduleHook*(point: SchedulePoint) {.inline.} =

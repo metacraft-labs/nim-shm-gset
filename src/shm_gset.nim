@@ -38,19 +38,19 @@
 ## bytes; a slot references its record by offset. No hot-path heap allocation on
 ## insert (the caller supplies the blob; the record is memcpy'd into the arena).
 ##
-## Deterministic SCHEDULE HOOKS (`shm_gset/hooks`, test-only `-d:shmSetScheduleHooks`)
+## Deterministic SCHEDULE HOOKS (`shm_gset/hooks`, test-only `-d:shmGSetScheduleHooks`)
 ## seam every CAS/publish site so M2 can drive interleavings without a retrofit.
 ##
 ## Portability: Linux + macOS (POSIX `mmap` MAP_SHARED). On any other platform
-## `shmSetSupported` is false and every op reports unavailable (`supported=false`
+## `shmGSetSupported` is false and every op reports unavailable (`supported=false`
 ## arm), so a caller degrades gracefully.
 
 import ./shm_gset/hooks
 export hooks.SchedulePoint, hooks.scheduleHooksEnabled
-when defined(shmSetScheduleHooks):
+when defined(shmGSetScheduleHooks):
   export hooks.setScheduleHook, hooks.ScheduleHook
 
-const shmSetSupported* = defined(linux) or defined(macosx)
+const shmGSetSupported* = defined(linux) or defined(macosx)
 
 const AppIdSep* = '~'
   ## Reserved separator between the caller-chosen appId and the rest of an anchor
@@ -70,8 +70,8 @@ func validAppId*(appId: string): bool =
 func alignUp*(n, a: int): int {.inline.} = (n + a - 1) and not (a - 1)
 
 const
-  ShmSetMagic* = 0x5347_4D48_53_00_01'u64  ## "SHM SG" — shm_gset shard magic.
-  ShmSetFormatVersion* = 1'u32
+  ShmGSetMagic* = 0x5347_4D48_53_00_01'u64  ## "SHM SG" — shm_gset shard magic.
+  ShmGSetFormatVersion* = 1'u32
 
 # --- shard file header (offset-only, base-independent) ----------------------
 #
@@ -131,7 +131,7 @@ type
     isSaturated   ## growth itself failed (OOM): SIGNALLED, surfaced by consumer
     isUnavailable ## the set is not attached (portable no-op arm / attach failed)
 
-when shmSetSupported:
+when shmGSetSupported:
   import std/[os, posix, sets, strutils, times]
 
   # BSD advisory whole-file lock (Linux + macOS share these op values). Used by
@@ -153,7 +153,7 @@ when shmSetSupported:
       arenaOff: int
       arenaCap: int
 
-    ShmSet* = object
+    ShmGSet* = object
       ## An attached view of a run's shard chain. `available` is false on any
       ## create/attach failure. Multi-producer, single-reader.
       available*: bool
@@ -210,7 +210,7 @@ when shmSetSupported:
 
   # --- mmap plumbing --------------------------------------------------------
 
-  when defined(shmSetScheduleHooks):
+  when defined(shmGSetScheduleHooks):
     var forcedNextMapBase {.threadvar.}: pointer
     proc setForcedNextMapBase*(p: pointer) =
       ## TEST-ONLY (design spec §4.5(b)): force the NEXT shard `mmap` to land at a
@@ -220,7 +220,7 @@ when shmSetSupported:
       forcedNextMapBase = p
 
   proc mapFd(fd: cint; size: int): ShmBase =
-    when defined(shmSetScheduleHooks):
+    when defined(shmGSetScheduleHooks):
       if forcedNextMapBase != nil:
         let want = forcedNextMapBase
         forcedNextMapBase = nil
@@ -250,14 +250,14 @@ when shmSetSupported:
     storeU64Relaxed(base, ShOffConsumerPid, 0)
     storeU64Relaxed(base, ShOffConsumerBoot, 0)
     storeU64Relaxed(base, ShOffConsumerAlive, 0)
-    storeU32Release(base, ShOffFormatVersion, ShmSetFormatVersion)
+    storeU32Release(base, ShOffFormatVersion, ShmGSetFormatVersion)
     # Publish magic LAST (release): an attacher that sees the magic also sees the
     # fully-initialised header + zeroed slots/arena.
-    storeU64Release(base, ShOffMagic, ShmSetMagic)
+    storeU64Release(base, ShOffMagic, ShmGSetMagic)
 
   proc headerValid(base: ShmBase; boot: uint64): bool =
-    loadU64Acquire(base, ShOffMagic) == ShmSetMagic and
-      loadU32Acquire(base, ShOffFormatVersion) == ShmSetFormatVersion and
+    loadU64Acquire(base, ShOffMagic) == ShmGSetMagic and
+      loadU32Acquire(base, ShOffFormatVersion) == ShmGSetFormatVersion and
       loadU64Relaxed(base, ShOffCreatorBootId) == boot
 
   proc mapShardFromFd(fd: cint; size: int; boot: uint64): ShardMap =
@@ -274,9 +274,9 @@ when shmSetSupported:
     result.arenaOff = int(loadU64Relaxed(base, ShOffArenaOff))
     result.arenaCap = int(loadU64Relaxed(base, ShOffArenaCap))
 
-  proc shardPath(s: ShmSet; k: int): string = s.basePrefix & ".shard" & $k
+  proc shardPath(s: ShmGSet; k: int): string = s.basePrefix & ".shard" & $k
 
-  proc openShard(s: var ShmSet; k: int): bool =
+  proc openShard(s: var ShmGSet; k: int): bool =
     ## Map shard `k` into this process (idempotent). Retries briefly to tolerate
     ## the window between a chain-count bump and the file appearing.
     if k < s.shards.len and not s.shards[k].base.isNil: return true
@@ -300,10 +300,10 @@ when shmSetSupported:
       if tries > 10000: return false
       discard sched_yield()
 
-  proc chainCount(s: var ShmSet): int {.inline.} =
+  proc chainCount(s: var ShmGSet): int {.inline.} =
     int(loadU64Acquire(s.shards[0].base, ShOffChainCount))
 
-  proc bumpChainCountTo(s: var ShmSet; target: int) =
+  proc bumpChainCountTo(s: var ShmGSet; target: int) =
     let b = s.shards[0].base
     var cur = loadU64Acquire(b, ShOffChainCount)
     while cur < uint64(target):
@@ -369,7 +369,7 @@ when shmSetSupported:
     let occ = loadU64Relaxed(sm.base, ShOffOccupied)
     occ * uint64(LoadDen) >= uint64(sm.cap * LoadNum)
 
-  # Process-global tmp uniquifier. A per-`ShmSet` counter is NOT enough: two
+  # Process-global tmp uniquifier. A per-`ShmGSet` counter is NOT enough: two
   # producer THREADS in the same process share `getpid()` and both start their
   # own `tmpCtr` at 1, so they would forge the SAME `.shardtmp.<pid>.1` name and
   # the `O_EXCL` loser's `EEXIST` would be misreported as a growth failure
@@ -377,7 +377,7 @@ when shmSetSupported:
   # sequence makes every temp name unique across threads.
   var gShardTmpSeq: uint64
 
-  proc appendShardFile(s: var ShmSet; newIndex, newCap, newArenaCap: int): bool =
+  proc appendShardFile(s: var ShmGSet; newIndex, newCap, newArenaCap: int): bool =
     ## Create shard `newIndex` if absent, publishing it fully-initialised under
     ## its final name via an EXCLUSIVE `link` (double-grow arbitration: the loser
     ## gets EEXIST, discards its temp — never a leaked shard file). Returns true
@@ -414,7 +414,7 @@ when shmSetSupported:
     if linked == 0: return true
     return fileExists(finalPath)      # a racer created it first (EEXIST)
 
-  proc growNewest(s: var ShmSet; expectedN: int; full: ShardMap): bool =
+  proc growNewest(s: var ShmGSet; expectedN: int; full: ShardMap): bool =
     ## Append a new, larger shard at index `expectedN` (or observe that someone
     ## else already did). Returns false only when growth itself fails (OOM) —
     ## the SIGNALLED saturation case.
@@ -438,7 +438,7 @@ when shmSetSupported:
     dir / (appId & AppIdSep & runId & "." & $boot & "." & $ownerPid)
 
   proc createSet*(dir, appId, runId: string; shard0Cap = 1024;
-      shard0ArenaCap = 256 * 1024): ShmSet =
+      shard0ArenaCap = 256 * 1024): ShmGSet =
     ## CONSUMER/owner side: create shard0 (the well-known anchor) and register
     ## this process as the live consumer. Pass `path0` to producers via
     ## `REPRO_MONITOR_DEP_SHM`. `appId` tags the chain so only THIS app's reaper
@@ -481,7 +481,7 @@ when shmSetSupported:
     storeU64Release(result.shards[0].base, ShOffConsumerAlive, 1)
     result.available = true
 
-  proc attachSet*(path0: string): ShmSet =
+  proc attachSet*(path0: string): ShmGSet =
     ## PRODUCER side: attach to a consumer-created chain via shard0's path.
     ## Returns an unavailable set (LF-2: caller fails fast, never spills) when
     ## the file is missing / wrong / stale (boot guard).
@@ -495,7 +495,7 @@ when shmSetSupported:
     if not openShard(result, 0): return
     result.available = true
 
-  proc detach*(s: var ShmSet) =
+  proc detach*(s: var ShmGSet) =
     for sm in s.shards.mitems:
       if not sm.base.isNil:
         discard munmap(cast[pointer](sm.base), sm.size)
@@ -504,7 +504,7 @@ when shmSetSupported:
     s.shards.setLen(0)
     s.available = false
 
-  proc insert*(s: var ShmSet; blob: openArray[byte]): InsertStatus =
+  proc insert*(s: var ShmGSet; blob: openArray[byte]): InsertStatus =
     ## Idempotent multi-producer insert. Re-observing an element is a no-op
     ## (`isExists`) — the structure is bounded by DISTINCT elements, not events,
     ## so backpressure never arises. A full shard/arena GROWS (never drops); only
@@ -527,7 +527,7 @@ when shmSetSupported:
           return isSaturated
         # loop: retry into the (now) newest shard — never drop.
 
-  proc contains*(s: var ShmSet; blob: openArray[byte]): bool =
+  proc contains*(s: var ShmGSet; blob: openArray[byte]): bool =
     ## Membership across the whole chain (probing, no mutation). For the reader's
     ## authoritative distinct set use `snapshot`.
     if not s.available: return false
@@ -546,7 +546,7 @@ when shmSetSupported:
         idx = (idx + 1) and int(mask); inc probes
     false
 
-  proc discoverMaxShard(s: var ShmSet): int =
+  proc discoverMaxShard(s: var ShmGSet): int =
     ## The highest shard index to union: max(chainCount-1, any shard file found
     ## on disk). The directory scan catches a shard whose chain-count bump was
     ## lost to a producer crash (publish-before-write robustness, §4.3.1).
@@ -563,7 +563,7 @@ when shmSetSupported:
           except ValueError: discard
     except CatchableError: discard
 
-  iterator items*(s: var ShmSet): seq[byte] =
+  iterator items*(s: var ShmGSet): seq[byte] =
     ## SINGLE-THREADED reader: union all shards, deduplicated. This is the source
     ## of truth for the depfile (design spec §4.3.3). Union is the G-Set's
     ## semilattice join, so duplicates across shards and partial/last-shard
@@ -585,16 +585,16 @@ when shmSetSupported:
           if not seen.containsOrIncl(elem):
             yield elem
 
-  proc snapshot*(s: var ShmSet): seq[seq[byte]] =
+  proc snapshot*(s: var ShmGSet): seq[seq[byte]] =
     ## Materialise the merged distinct set (convenience over `items`).
     for e in s.items: result.add e
 
-  proc shardCount*(s: var ShmSet): int =
+  proc shardCount*(s: var ShmGSet): int =
     ## Number of shards linked so far (>= 1). The shard-append metric.
     if not s.available: return 0
     discoverMaxShard(s) + 1
 
-  proc claimedSlots*(s: var ShmSet): uint64 =
+  proc claimedSlots*(s: var ShmGSet): uint64 =
     ## Sum of claimed slots across shards. An UPPER bound on distinct elements
     ## (an element inserted before and after a grow is counted in two shards);
     ## the exact distinct count is `snapshot().len`.
@@ -604,17 +604,17 @@ when shmSetSupported:
       if openShard(s, k):
         result += loadU64Relaxed(s.shards[k].base, ShOffOccupied)
 
-  proc growthFailures*(s: var ShmSet): uint64 =
+  proc growthFailures*(s: var ShmGSet): uint64 =
     ## SIGNALLED saturation count (OOM growth failures). Nonzero ⇒ the consumer
     ## surfaces `mcIncomplete`; it is NEVER a silent drop.
     if not s.available or s.shards.len == 0: return 0
     loadU64Relaxed(s.shards[0].base, ShOffGrowthFailed)
 
-  proc markConsumerGone*(s: var ShmSet) =
+  proc markConsumerGone*(s: var ShmGSet) =
     if s.available and s.shards.len > 0 and not s.shards[0].base.isNil:
       storeU64Release(s.shards[0].base, ShOffConsumerAlive, 0)
 
-  proc consumerAlive*(s: ShmSet): bool =
+  proc consumerAlive*(s: ShmGSet): bool =
     ## Whether the host/consumer that owns shard0 is still registered as live
     ## (LF-4). The producer interface (`transport`) surfaces this as
     ## `emConsumerGone` so a monitored process learns to stop writing to an
@@ -622,7 +622,7 @@ when shmSetSupported:
     if not s.available or s.shards.len == 0 or s.shards[0].base.isNil: return false
     loadU64Acquire(s.shards[0].base, ShOffConsumerAlive) != 0'u64
 
-  proc assertNoAbsolutePointers*(s: var ShmSet) =
+  proc assertNoAbsolutePointers*(s: var ShmGSet) =
     ## DEBUG (design spec §4.5(b)): assert every stored slot value is an in-shard
     ## OFFSET, never an absolute pointer into the mapping. A leaked absolute
     ## pointer would either fall inside the mapping's address window
@@ -647,7 +647,7 @@ when shmSetSupported:
         doAssert int(entry) + ArenaRecHdr + rlen <= sm.size,
           "arena record overruns the shard (torn/corrupt offset)"
 
-  proc shards0Base*(s: ShmSet): pointer =
+  proc shards0Base*(s: ShmGSet): pointer =
     ## The mapped base address of shard0 in THIS process (for the
     ## position-independence test, which asserts two processes/mappings observe
     ## the same set at DIFFERENT bases — no absolute pointer may live in the
@@ -714,7 +714,7 @@ when shmSetSupported:
 else:
   # --- portable no-op arm ---------------------------------------------------
   type
-    ShmSet* = object
+    ShmGSet* = object
       available*: bool
       dir*: string
       path0*: string
@@ -723,20 +723,20 @@ else:
   proc shardBasePrefix*(dir, appId, runId: string; boot, ownerPid: uint64): string =
     dir & "/" & appId & "~" & runId & "." & $boot & "." & $ownerPid
   proc createSet*(dir, appId, runId: string; shard0Cap = 1024;
-      shard0ArenaCap = 256 * 1024): ShmSet =
-    ShmSet(available: false, dir: dir)
-  proc attachSet*(path0: string): ShmSet =
-    ShmSet(available: false, path0: path0)
-  proc detach*(s: var ShmSet) = discard
-  proc insert*(s: var ShmSet; blob: openArray[byte]): InsertStatus = isUnavailable
-  proc contains*(s: var ShmSet; blob: openArray[byte]): bool = false
-  iterator items*(s: var ShmSet): seq[byte] = discard
-  proc snapshot*(s: var ShmSet): seq[seq[byte]] = @[]
-  proc shardCount*(s: var ShmSet): int = 0
-  proc claimedSlots*(s: var ShmSet): uint64 = 0
-  proc growthFailures*(s: var ShmSet): uint64 = 0
-  proc markConsumerGone*(s: var ShmSet) = discard
-  proc consumerAlive*(s: ShmSet): bool = false
-  proc assertNoAbsolutePointers*(s: var ShmSet) = discard
-  proc shards0Base*(s: ShmSet): pointer = nil
+      shard0ArenaCap = 256 * 1024): ShmGSet =
+    ShmGSet(available: false, dir: dir)
+  proc attachSet*(path0: string): ShmGSet =
+    ShmGSet(available: false, path0: path0)
+  proc detach*(s: var ShmGSet) = discard
+  proc insert*(s: var ShmGSet; blob: openArray[byte]): InsertStatus = isUnavailable
+  proc contains*(s: var ShmGSet; blob: openArray[byte]): bool = false
+  iterator items*(s: var ShmGSet): seq[byte] = discard
+  proc snapshot*(s: var ShmGSet): seq[seq[byte]] = @[]
+  proc shardCount*(s: var ShmGSet): int = 0
+  proc claimedSlots*(s: var ShmGSet): uint64 = 0
+  proc growthFailures*(s: var ShmGSet): uint64 = 0
+  proc markConsumerGone*(s: var ShmGSet) = discard
+  proc consumerAlive*(s: ShmGSet): bool = false
+  proc assertNoAbsolutePointers*(s: var ShmGSet) = discard
+  proc shards0Base*(s: ShmGSet): pointer = nil
   proc reapStaleSegments*(dir, appId: string): int = 0

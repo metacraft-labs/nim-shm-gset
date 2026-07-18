@@ -18,7 +18,7 @@
 ## element key/value codec is io-mon's Layer 2/3, above this surface.
 
 import ../shm_gset
-export shm_gset.ShmSet   # transports may hand back the raw view when useful
+export shm_gset.ShmGSet   # transports may hand back the raw view when useful
 
 type
   EmitStatus* = enum
@@ -33,14 +33,14 @@ type
 
   SetProducer* = object
     ## Producer-side handle over an attached shard chain.
-    s: ShmSet
+    s: ShmGSet
     maxElementBytes: int   ## 0 == unlimited; the SET's growth absorbs oversize
                            ## (LF-5), so a nonzero cap is only for a transport
                            ## that genuinely cannot frame an element.
 
   SetHost* = object
     ## Consumer/host-side lifecycle owner (create → path0 → snapshot → detach).
-    s: ShmSet
+    s: ShmGSet
 
 # --- producer side ----------------------------------------------------------
 

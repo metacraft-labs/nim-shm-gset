@@ -12,8 +12,8 @@ test:
     nim c -r {{nim_flags}} tests/test_shm_gset.nim
     nim c -r {{nim_flags}} tests/test_shm_gset_transport.nim
     nim c -r {{nim_flags}} tests/test_shm_gset_lf5.nim
-    nim c -r {{nim_flags}} -d:shmSetScheduleHooks tests/test_shm_gset_hooks.nim
-    nim c -r {{nim_flags}} -d:shmSetScheduleHooks tests/test_shm_gset_concurrency.nim
+    nim c -r {{nim_flags}} -d:shmGSetScheduleHooks tests/test_shm_gset_hooks.nim
+    nim c -r {{nim_flags}} -d:shmGSetScheduleHooks tests/test_shm_gset_concurrency.nim
     nim c -r {{nim_flags}} tests/test_shm_gset_threads.nim
     nim c -r {{nim_flags}} tests/test_shm_gset_soak.nim
 
