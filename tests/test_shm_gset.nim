@@ -27,9 +27,38 @@ proc strOf(b: seq[byte]): string =
   result = newString(b.len)
   for i in 0 ..< b.len: result[i] = char(b[i])
 
+when defined(linux):
+  proc shardFdCount(pathPrefix: string): int =
+    for fd in 3 .. 255:
+      var buf: array[4096, char]
+      let n = posix.readlink(("/proc/self/fd/" & $fd).cstring,
+        cast[cstring](addr buf[0]), buf.len)
+      if n <= 0:
+        continue
+      var target = newString(n)
+      copyMem(addr target[0], addr buf[0], n)
+      if target.startsWith(pathPrefix):
+        inc result
+
 # --- basic membership + idempotency ----------------------------------------
 
 suite "membership + idempotent inserts":
+  when defined(linux):
+    test "mapped shards do not retain backing file descriptors":
+      let dir = freshDir("fd-lifetime")
+      defer: removeDir(dir)
+      var owner = createSet(dir, "io-mon", "edge",
+        shard0Cap = 64, shard0ArenaCap = 8192)
+      check owner.available
+      check shardFdCount(owner.path0) == 0
+      var producer = attachSet(owner.path0)
+      check producer.available
+      check shardFdCount(owner.path0) == 0
+      check producer.insert(bytesOf("still-mapped")) == isInserted
+      check owner.contains(bytesOf("still-mapped"))
+      producer.detach()
+      owner.detach()
+
   test "insert / contains / dedup":
     let dir = freshDir("basic")
     defer: removeDir(dir)

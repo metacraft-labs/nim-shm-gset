@@ -147,7 +147,6 @@ when shmGSetSupported:
     ShardMap = object
       base: ShmBase
       size: int
-      fd: cint
       cap: int
       slotsOff: int
       arenaOff: int
@@ -261,14 +260,12 @@ when shmGSetSupported:
       loadU64Relaxed(base, ShOffCreatorBootId) == boot
 
   proc mapShardFromFd(fd: cint; size: int; boot: uint64): ShardMap =
-    result.fd = -1
     let base = mapFd(fd, size)
     if base.isNil: return
     if not headerValid(base, boot):
       discard munmap(cast[pointer](base), size); return
     result.base = base
     result.size = size
-    result.fd = fd
     result.cap = int(loadU64Relaxed(base, ShOffCapacity))
     result.slotsOff = int(loadU64Relaxed(base, ShOffSlotsOff))
     result.arenaOff = int(loadU64Relaxed(base, ShOffArenaOff))
@@ -291,8 +288,9 @@ when shmGSetSupported:
         let fd = open(path.cstring, O_RDWR)
         if fd < 0: return false
         let sm = mapShardFromFd(fd, size, s.boot)
+        discard close(fd)
         if sm.base.isNil:
-          discard close(fd); return false
+          return false
         if k >= s.shards.len: s.shards.setLen(k + 1)
         s.shards[k] = sm
         return true
@@ -500,7 +498,6 @@ when shmGSetSupported:
       if not sm.base.isNil:
         discard munmap(cast[pointer](sm.base), sm.size)
         sm.base = nil
-        if sm.fd > 0: discard close(sm.fd)
     s.shards.setLen(0)
     s.available = false
 
