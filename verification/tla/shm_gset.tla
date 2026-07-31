@@ -346,6 +346,33 @@ NoShardLost ==
 \* ReaperNeverReapsLiveRun: no shard is GC'd while the run holds its flock.
 ReaperNeverReapsLiveRun == flockHeld => (reaped = FALSE)
 
+\* --- probe-run completeness -----------------------------------------------
+\* The distance from `h` to the FIRST EMPTY slot at or after it (Cap if the
+\* table is full) — exactly where a linear-probe walk stops.
+FirstEmptyFrom(s, h) ==
+    IF \E j \in 0..(Cap-1) : slot[s][(h + j) % Cap] = 0
+    THEN CHOOSE j \in 0..(Cap-1) :
+            /\ slot[s][(h + j) % Cap] = 0
+            /\ \A m \in 0..(j-1) : slot[s][(h + m) % Cap] # 0
+    ELSE Cap
+
+\* The elements a walk from `h` yields: the run, and nothing past it.
+RunFrom(s, h) == { slot[s][(h + j) % Cap] : j \in 0..(FirstEmptyFrom(s, h) - 1) }
+
+\* ProbeRunComplete: every element published in a shard is reachable from ITS OWN
+\* home slot by walking to the first empty slot. There is no stored chain and no
+\* pointer update — the run IS the enumeration — so this is the invariant that
+\* makes an enumeration possible at all. It holds because a claim only ever turns
+\* an empty slot non-empty (nothing is ever deleted), so a run is never punctured
+\* and a walk can neither stop early nor skip a present element.
+\*
+\* This is the identity-key instance of the property; `shm_gset_keyed` checks the
+\* general one, where a whole SET of elements shares one home slot.
+ProbeRunComplete ==
+    \A s \in ExistingShards :
+      \A i \in 0..(Cap-1) :
+        (slot[s][i] # 0) => (slot[s][i] \in RunFrom(s, Home[slot[s][i]]))
+
 \* CannotSaturate: with the chosen bounds, growth never hits the MaxShards wall
 \* (so the union invariants are exercised on the real grow path, not masked by a
 \* saturation early-out). If TLC reports this violated, raise MaxShards.

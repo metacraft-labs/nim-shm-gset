@@ -17,3 +17,15 @@ task test, "Build + run the nim-shm-gset test suite":
   # prove the test-only seams compile and stay behaviour-preserving.
   exec "nim c -r --hints:off --threads:on --warning:BareExcept:off " &
     "-d:shmGSetScheduleHooks tests/test_shm_gset_hooks.nim"
+  # Algorithmic properties of the parameterised key discipline (probe-run
+  # completeness, tombstone ordering, flatten/retire) plus its concurrency
+  # oracles. `--path:tests` picks up the action-cache reference key policy.
+  # `-d:nimAllocStats` instruments the allocator's alloc/dealloc counters, which
+  # is what suite E measures; without it the runtime returns a zeroed AllocStats
+  # and the measurement would be vacuous. E1 self-checks that the counters are
+  # live and fails rather than passing emptily, so this flag must stay in step
+  # with the same flag in the Justfile `test` recipe.
+  exec "nim c -r --hints:off --threads:on --warning:BareExcept:off " &
+    "-d:nimAllocStats --path:tests tests/test_shm_gset_keyed.nim"
+  exec "nim c -r --hints:off --threads:on --warning:BareExcept:off " &
+    "--path:tests tests/test_shm_gset_keyed_concurrency.nim"
