@@ -53,6 +53,42 @@ regardless of write order, writer, or duplication.
 - **Portable no-op arm**: compiles everywhere; `shmGSetSupported == false` off
   Linux/macOS, where every op reports unavailable.
 
+## The key discipline is a parameter
+
+The structure separates three projections of an element that used to be the same
+thing, and makes them a compile-time parameter `K` of `ShmGSetT[K]`:
+
+| projection | hook | what it is |
+|---|---|---|
+| the bytes **stored** | — | the whole blob, memcpy'd into the arena |
+| the bytes **hashed** | `primaryKeySpan` + `hashKey` | the PRIMARY KEY. All elements sharing one occupy a single contiguous probe run, so `withPrimaryKey` enumerates them with no stored chain and no pointer update |
+| the thing **compared** | `identityFp` + `identityEq` | element IDENTITY: a 64-bit fast-reject fingerprint in the arena record plus the authoritative comparison |
+
+`K` is a phantom type carrying nothing at runtime; the hooks are overloads on
+`typedesc[K]`, resolved and inlined at instantiation — no vtable, no indirect
+call, no heap, and nothing added to shared memory. A policy may additionally
+enlarge the per-chain control block (`extraControlWords`, e.g. for a generation
+counter that orders tombstones) and must then override `keyFormatVersion` so a
+chain is never attached under a different discipline.
+
+`ShmGSet = ShmGSetT[IdentityKey]` makes all three projections the identity, which
+is io-mon's discipline: same API, same probe behaviour, and **byte-identical
+shard files** (asserted against golden digests in `tests/test_shm_gset_keyed.nim`).
+
+```nim
+# a multimap keyed on a field of the element
+type MyKey = object
+proc primaryKeySpan*(_: typedesc[MyKey]; blob: openArray[byte]): tuple[a, b: int] =
+  (20, 51)                                    # hash THIS sub-range only
+proc keyFormatVersion*(_: typedesc[MyKey]): uint32 = 2
+proc extraControlWords*(_: typedesc[MyKey]): int = 1   # e.g. a generation counter
+
+var s = createSetT(dir, "app", "run", MyKey)
+discard s.insert(element)                     # placed by primary key
+for v in s.withPrimaryKey(keyBytes):          # the probe run IS the enumeration
+  use(v.bytes)                                # zero-copy view, no allocation
+```
+
 ## API sketch
 
 ```nim

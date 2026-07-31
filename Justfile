@@ -4,7 +4,7 @@
 # (nimble derives the package version from the VCS revision). This `just`
 # runner needs no commit, so it is the blessed runner during development.
 
-nim_flags := "--hints:off --threads:on --warning:BareExcept:off --path:src"
+nim_flags := "--hints:off --threads:on --warning:BareExcept:off --path:src --path:tests"
 
 # Build + run the full functional + concurrency-verification suite (design spec
 # §4.5). x86-64 Linux. Deterministic — no flaky stress in `test`.
@@ -16,6 +16,12 @@ test:
     nim c -r {{nim_flags}} -d:shmGSetScheduleHooks tests/test_shm_gset_concurrency.nim
     nim c -r {{nim_flags}} tests/test_shm_gset_threads.nim
     nim c -r {{nim_flags}} tests/test_shm_gset_soak.nim
+    # -d:nimAllocStats instruments the allocator's alloc/dealloc counters, which
+    # is what suite E measures. WITHOUT it the runtime returns a zeroed
+    # AllocStats unconditionally and E1 would pass vacuously; E1 self-checks
+    # this and fails rather than passing emptily if the flag is dropped.
+    nim c -r {{nim_flags}} -d:nimAllocStats tests/test_shm_gset_keyed.nim
+    nim c -r {{nim_flags}} tests/test_shm_gset_keyed_concurrency.nim
 
 # Sanitizers (design spec §4.5(g)) — TSAN + ASan/UBSan over the single-process
 # thread harness (the algorithm's memory ordering; TSAN does NOT cross the
@@ -33,6 +39,12 @@ test-sanitizers:
         --passl:"-fsanitize=address,undefined" \
         -o:/tmp/shmgset-asan-threads tests/test_shm_gset_threads.nim
     ASAN_OPTIONS="detect_leaks=0" /tmp/shmgset-asan-threads
+    # The same treatment for the KEYED discipline's concurrency suite, which
+    # exercises the probe-run walk and the flatten/retire path under threads.
+    nim c {{nim_flags}} --mm:orc -d:useMalloc --debugger:native \
+        --passc:-fsanitize=thread --passl:-fsanitize=thread \
+        -o:/tmp/shmgset-tsan-keyed tests/test_shm_gset_keyed_concurrency.nim
+    TSAN_OPTIONS="halt_on_error=1" /tmp/shmgset-tsan-keyed
 
 # Longer parameterizable many-process soak (design spec §4.5(f)). The default in
 # `test` is a short 2s; use this for a longer bounded run, e.g. `just soak 300`.
@@ -69,6 +81,15 @@ test-valgrind:
 verify-tla:
     cd verification/tla && nix shell nixpkgs#tlaplus --command \
         tlc -config shm_gset_MC.cfg shm_gset_MC.tla
+    # The KEYED discipline: primary hash over a sub-range of the element, so a
+    # whole set of elements shares one probe run; plus tombstone eviction under a
+    # global generation counter. Two racing producers over two primary keys that
+    # SHARE a home slot.
+    cd verification/tla && nix shell nixpkgs#tlaplus --command \
+        tlc -workers 4 -config shm_gset_keyed_MC.cfg shm_gset_keyed_MC.tla
+    # Flatten (copy forward -> drain -> retire) racing a concurrent reader.
+    cd verification/tla && nix shell nixpkgs#tlaplus --command \
+        tlc -workers 4 -config shm_gset_keyed_flat_MC.cfg shm_gset_keyed_flat_MC.tla
 
 # rr chaos-mode record + deterministic replay of the multi-process fork oracle
 # (design spec §4.5(f)). Explores rare fork/grow interleavings under a randomised

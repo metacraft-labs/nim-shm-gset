@@ -9,6 +9,8 @@ tests/test_shm_gset_lf5
 tests/test_shm_gset_concurrency
 tests/test_shm_gset_threads
 tests/test_shm_gset_soak
+tests/test_shm_gset_keyed
+tests/test_shm_gset_keyed_concurrency
 benchmarks/bench_transports
 # TLC model-checker scratch (state graph, translation backups)
 verification/tla/states/
