@@ -12,6 +12,10 @@ test:
     nim c -r {{nim_flags}} tests/test_shm_gset.nim
     nim c -r {{nim_flags}} tests/test_shm_gset_transport.nim
     nim c -r {{nim_flags}} tests/test_shm_gset_lf5.nim
+    # Reaper identity: runId lives in the shard HEADER, not the file name —
+    # header attribution, appId scoping, both staleness axes, and migration of a
+    # chain written under the pre-HM-1 naming + header layout.
+    nim c -r {{nim_flags}} tests/test_shm_gset_reaper_identity.nim
     nim c -r {{nim_flags}} -d:shmGSetScheduleHooks tests/test_shm_gset_hooks.nim
     nim c -r {{nim_flags}} -d:shmGSetScheduleHooks tests/test_shm_gset_concurrency.nim
     nim c -r {{nim_flags}} tests/test_shm_gset_threads.nim

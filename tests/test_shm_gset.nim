@@ -210,11 +210,15 @@ suite "reaper (cross-restart GC)":
     var st: cint
     discard waitpid(child, st, 0)
 
-    # The dead run's shard0 exists on disk (name now carries the `io-mon~` appId
-    # tag ahead of the runId).
+    # The dead run's shard0 exists on disk. The name carries the `io-mon~` appId
+    # tag and an opaque chain uniquifier — NOT the runId, which lives in the
+    # header — so the dead chain is the one anchor here that is not the live
+    # one.
     var deadAnchor = ""
     for _, p in walkDir(dir):
-      if extractFilename(p).startsWith("io-mon~deadEdge."): deadAnchor = p
+      let n = extractFilename(p)
+      if n.startsWith("io-mon~") and n.endsWith(".shard0") and p != live.path0:
+        deadAnchor = p
     check deadAnchor.len > 0
     check fileExists(deadAnchor)
 
@@ -235,7 +239,7 @@ suite "reaper (cross-restart GC)":
     defer: removeDir(dir)
     let wrongBoot = bootId() + 1          # any value != the current boot-id
     let livePid = uint64(getpid())        # a pid that IS alive on this boot
-    let stalePrefix = shardBasePrefix(dir, "io-mon", "rebootedEdge", wrongBoot, livePid)
+    let stalePrefix = shardBasePrefix(dir, "io-mon", 1'u64, wrongBoot, livePid)
     let staleAnchor = stalePrefix & ".shard0"
     writeFile(staleAnchor, "forged wrong-boot shard0")
     check fileExists(staleAnchor)

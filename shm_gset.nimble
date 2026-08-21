@@ -13,6 +13,11 @@ task test, "Build + run the nim-shm-gset test suite":
   # Functional + concurrency (multi-process fork) suite for the sharded G-Set.
   exec "nim c -r --hints:off --threads:on --warning:BareExcept:off " &
     "tests/test_shm_gset.nim"
+  # Reaper identity: the runId lives in the shard HEADER, not the file name —
+  # header attribution, appId scoping, both staleness axes, and migration of a
+  # chain written under the pre-HM-1 naming + header layout.
+  exec "nim c -r --hints:off --threads:on --warning:BareExcept:off " &
+    "tests/test_shm_gset_reaper_identity.nim"
   # The same suite compiled with the deterministic schedule hooks enabled, to
   # prove the test-only seams compile and stay behaviour-preserving.
   exec "nim c -r --hints:off --threads:on --warning:BareExcept:off " &

@@ -80,20 +80,27 @@ suite "A. the identity instantiation is bit-for-bit the pre-existing structure":
       (fingerprint(newSeq[byte](0)) or 1'u64)      # the empty element too
     s.detach()
 
-  test "A3 the on-disk shard bytes are UNCHANGED (golden digests)":
-    # Digests captured by running this exact insert sequence against the build
-    # that predates the parameterisation. Only the three host-varying header
-    # fields are masked (creator boot id, consumer pid, consumer boot);
-    # everything else — every header field value, the whole slot array, every
-    # arena byte, the file sizes, the shard COUNT — is compared.
+  test "A3 the on-disk shard bytes are FROZEN (golden digests)":
+    # Digests captured by running this exact insert sequence. Only the three
+    # host-varying header fields are masked (creator boot id, consumer pid,
+    # consumer boot); everything else — every header field value, the whole slot
+    # array, every arena byte, the file sizes, the shard COUNT — is compared.
     #
-    # If a future change to the key discipline forces io-mon's format to move,
-    # this test fails, which is the intended alarm.
+    # If a change to the key discipline or the header layout moves io-mon's
+    # format, this test fails, which is the intended alarm.
+    #
+    # RE-BASELINED ONCE, deliberately, when `runId` moved out of the shard file
+    # NAME and into the header (magic layout revision 1 → 2): the header grew
+    # from 128 to 256 bytes to carry the run identity, which shifts the slot
+    # array and the arena. The file SIZES are unchanged (the extra 128 bytes fit
+    # inside the existing 4 KiB alignment) and the shard COUNT is unchanged, so
+    # the alarm here is purely about content. The digests are a function of the
+    # runId too now, which is why this test fixes it at "goldenEdge".
     const golden = [
-      (4096,   "edad141e54d89507cfaf2316094eec6ade60c99d"),
-      (12288,  "823750a7181057f98043669fa102eb29086dbc64"),
-      (45056,  "e6c911ad15acb097847bd4d53c23c8d394f9c889"),
-      (167936, "38f2b50c285af9201b40180947c62ab7abb0fd3f")]
+      (4096,   "06c43f2e2d75c1b908ae7acca19dbaa3b5a6ac36"),
+      (12288,  "ac1b082d5c6fa73d3bb43406e8a0947623066720"),
+      (45056,  "b7bbe8df566ff57030e39a6de5c335e90ac1c0e8"),
+      (167936, "691bedc2bc97b461d9f1bf22786d575c800f27ee")]
     let dir = freshDir("golden")
     defer: removeDir(dir)
     var s = createSet(dir, "io-mon", "goldenEdge", shard0Cap = 64,
@@ -682,7 +689,8 @@ suite "F. a chain cannot be read under the wrong key discipline":
 
   test "F2 the extra control block does not disturb the identity layout":
     # AcIndexKey reserves two control words, which pushes its slot array past the
-    # fixed header; IdentityKey reserves none and keeps slots at offset 128.
+    # fixed header; IdentityKey reserves none and keeps slots at
+    # `ShardHeaderSize` exactly.
     check slotsOffFor(0) == ShardHeaderSize
     check slotsOffFor(extraControlWords(IdentityKey)) == ShardHeaderSize
     check slotsOffFor(extraControlWords(AcIndexKey)) > ShardHeaderSize
@@ -885,8 +893,14 @@ suite "G. flatten-then-retire never makes an element unobservable":
 
     # A live, NOT-drained shard that cannot be mapped: truncate it below the
     # header, which is one of the several distinct reasons `openShard` fails.
-    var fresh = createSet(dir, "io-mon", "edge", shard0Cap = 64,
-      shard0ArenaCap = 1 shl 16)                # a peer that has not mapped it
+    # The peer is a genuine ATTACH to the same chain: it has shard0 mapped and
+    # shard 1 not. (It used to be a second `createSet` with the same runId,
+    # which only worked because the runId was part of the file name and made
+    # the two calls collide on one anchor — the second call then silently
+    # REPLACED shard0 on disk. Now that the name carries an opaque chain
+    # uniquifier instead, a second create is a different chain, and attaching is
+    # both what this test means and what the old spelling was pretending to do.)
+    var fresh = attachSet(s.path0)              # a peer that has not mapped it
     check fresh.available
     writeFile(victimPath, "")
     check (not fresh.retireShard(1))            # refuses: not known to be drained
@@ -895,8 +909,7 @@ suite "G. flatten-then-retire never makes an element unobservable":
 
     # Retiring a shard that is genuinely gone is a no-op that succeeds.
     removeFile(victimPath)
-    var after = createSet(dir, "io-mon", "edge", shard0Cap = 64,
-      shard0ArenaCap = 1 shl 16)
+    var after = attachSet(s.path0)
     check after.retireShard(1)
     after.detach()
     s.detach()

@@ -86,11 +86,18 @@ const shmGSetSupported* = defined(linux) or defined(macosx)
 
 const AppIdSep* = '~'
   ## Reserved separator between the caller-chosen appId and the rest of an anchor
-  ## stem (`{appId}~{runId}.{boot}.{pid}`). An appId MUST NOT contain it (see
+  ## stem (`{appId}~{chainSeq}.{boot}.{pid}`). An appId MUST NOT contain it (see
   ## `validAppId` / `createSet`), so the reaper recovers the appId unambiguously
-  ## by splitting the stem at its FIRST occurrence — correct even when `runId`
-  ## itself contains dots or tildes. This is what lets `reapStaleSegments` scope
-  ## to ONE app and never touch (or even liveness-check) another app's segments.
+  ## by splitting the stem at its FIRST occurrence. This is what lets
+  ## `reapStaleSegments` scope to ONE app and never touch (or even
+  ## liveness-check) another app's segments.
+  ##
+  ## The stem carries ONLY what the reaper needs to SCOPE and to judge STALENESS:
+  ## the appId, the creating boot id and the owner pid, plus an opaque
+  ## `chainSeq` that makes two chains owned by one process distinct on disk. The
+  ## run IDENTITY (`runId`) is NOT in the name — it lives in shard0's header
+  ## (`ShOffRunId`), so a recycled chain can be re-stamped in place without
+  ## renaming a single file and can never carry a stale name-borne runId.
 
 func validAppId*(appId: string): bool =
   ## An appId is a filesystem-safe, separator-free tag. Reject empty, the
@@ -102,7 +109,22 @@ func validAppId*(appId: string): bool =
 func alignUp*(n, a: int): int {.inline.} = (n + a - 1) and not (a - 1)
 
 const
-  ShmGSetMagic* = 0x5347_4D48_53_00_01'u64  ## "SHM SG" — shm_gset shard magic.
+  ShmGSetMagic* = 0x5347_4D48_53_00_02'u64
+    ## "SHM SG" — shm_gset shard magic; the low byte is the HEADER LAYOUT
+    ## revision, which is independent of the key discipline's
+    ## `keyFormatVersion`. Revision 2 added the in-header `runId` and moved the
+    ## slot array to offset 256; every policy's chains changed shape at once, so
+    ## the layout revision belongs in the magic rather than in each policy's
+    ## version word.
+  ShmGSetMagicV1* = 0x5347_4D48_53_00_01'u64
+    ## The pre-HM-1 layout: no in-header `runId`, 128-byte header, and the runId
+    ## carried in the FILE NAME. Never attached — `headerValid` accepts only the
+    ## CURRENT magic. The reaper does not test for this value either: it reads
+    ## any non-current magic as "no header identity" (`readAnchorRunId`) and
+    ## falls back to the NAME component, so a legacy chain is still judged and
+    ## collected by the ordinary staleness rule rather than skipped and leaked.
+    ## The constant is exported so the migration test can write out a genuine v1
+    ## shard rather than a stub.
   ShmGSetFormatVersion* = 1'u32
     ## Format version of the DEFAULT (`IdentityKey`) key discipline. A policy
     ## with a different discipline must pick its own via `keyFormatVersion`.
@@ -110,8 +132,16 @@ const
 # --- shard file header (offset-only, base-independent) ----------------------
 #
 # All 8-byte fields on 8-byte-aligned offsets. shard0 is authoritative for the
-# control block (chainCount / growthFailed / consumer-liveness); those fields are
-# present but unused in shards > 0.
+# control block (chainCount / growthFailed / consumer-liveness / runId); those
+# fields are present but unused in shards > 0.
+#
+# `runId` is the chain's RUN IDENTITY and lives here rather than in the file
+# name, so a chain can be re-stamped in place (the recycling milestone) without
+# renaming its shard files, and so a reused chain can never carry a stale
+# name-borne runId. It is a length-prefixed, NUL-padded byte field, written once
+# by `createSetT` before the magic is published; only shard0's copy is
+# meaningful (a growth shard is created by a PRODUCER, which does not know the
+# runId, and writes length 0).
 const
   ShOffMagic* = 0                          # u64 (published LAST on init)
   ShOffFormatVersion* = 8                  # u32
@@ -130,7 +160,10 @@ const
   ShOffConsumerPid* = 96                   # u64
   ShOffConsumerBoot* = 104                 # u64
   ShOffConsumerAlive* = 112                # u64
-  ShardHeaderSize* = 128                   # align64 padding to a cache line
+  ShOffRunIdLen* = 120                     # u32 (byte length of the runId)
+  ShOffRunId* = 128                        # runId bytes, NUL-padded
+  RunIdMaxBytes* = 120                     # capacity of the runId field
+  ShardHeaderSize* = 256                   # align64 padding to a cache line
   ShOffExtraControl* = ShardHeaderSize     # policy-declared extra control words
                                            # (u64 each) start here; shard0 is
                                            # authoritative, as for the rest of
@@ -230,10 +263,10 @@ proc keyFormatVersion*[K](_: typedesc[K]): uint32 {.inline.} =
 
 proc extraControlWords*[K](_: typedesc[K]): int {.inline.} =
   ## Number of extra u64 control words reserved in every shard header, right
-  ## after the fixed 128-byte block (shard0's are the authoritative ones). They
-  ## are opaque atomics the consumer owns — e.g. a global generation counter
-  ## that totally orders tombstones against records, or a bypass counter.
-  ## Default 0, which keeps the slot array at offset 128 exactly as before.
+  ## after the fixed `ShardHeaderSize` block (shard0's are the authoritative
+  ## ones). They are opaque atomics the consumer owns — e.g. a global generation
+  ## counter that totally orders tombstones against records, or a bypass counter.
+  ## Default 0, which puts the slot array at `ShardHeaderSize` exactly.
   0
 
 func slotsOffFor*(extraWords: int): int {.inline.} =
@@ -252,6 +285,34 @@ type
     isExists      ## the element was already present (idempotent no-op)
     isSaturated   ## growth itself failed (OOM): SIGNALLED, surfaced by consumer
     isUnavailable ## the set is not attached (portable no-op arm / attach failed)
+
+  ReapedSegment* = object
+    ## One chain the reaper collected, with the identity it was ATTRIBUTED to.
+    ## `reapStaleSegments` returns only the file count; this is the same walk
+    ## with the attribution kept, for a caller that reports or audits what was
+    ## collected.
+    anchor*: string          ## path of the reaped shard0
+    runId*: string           ## the chain's run identity
+    runIdFromHeader*: bool   ## true  ⇒ `runId` was read from shard0's HEADER
+                             ## false ⇒ the header was unreadable (a LEGACY
+                             ##         pre-HM-1 chain, a truncated leftover, or
+                             ##         not a shard at all) and `runId` is the
+                             ##         best-effort name component the old
+                             ##         `{appId}~{runId}.{boot}.{pid}` scheme
+                             ##         carried there. Never trust it as
+                             ##         identity; it exists so a migration is
+                             ##         diagnosable rather than opaque.
+    boot*: uint64            ## creating boot id, from the NAME (staleness axis)
+    ownerPid*: uint64        ## owner pid, from the NAME (staleness axis)
+    filesRemoved*: int       ## shard files unlinked for this chain
+
+func validRunId*(runId: string): bool =
+  ## A runId must fit the fixed-size header field (`RunIdMaxBytes`). It is
+  ## otherwise unconstrained — dots, tildes and path separators are all fine now
+  ## that it is not part of any file name. `createSetT` REFUSES a longer one
+  ## rather than truncating: a silently shortened identity is a
+  ## misattribution waiting to happen.
+  runId.len <= RunIdMaxBytes
 
 when shmGSetSupported:
   import std/[os, posix, sets, strutils, times]
@@ -389,7 +450,11 @@ when shmGSetSupported:
     cast[ShmBase](p)
 
   proc initShardHeader(base: ShmBase; shardId, cap, arenaCap: int;
-      boot: uint64; chainCount: uint64; fmtVersion: uint32; extraWords: int) =
+      boot: uint64; chainCount: uint64; fmtVersion: uint32; extraWords: int;
+      runId = "") =
+    ## `runId` is the chain's run identity and is meaningful only in shard0; a
+    ## growth shard is appended by a producer that does not know it and passes
+    ## the default empty string.
     let slotsOff = slotsOffFor(extraWords)
     storeU32Relaxed(base, ShOffFlags, 0)
     storeU64Relaxed(base, ShOffCreatorBootId, boot)
@@ -405,12 +470,28 @@ when shmGSetSupported:
     storeU64Relaxed(base, ShOffConsumerPid, 0)
     storeU64Relaxed(base, ShOffConsumerBoot, 0)
     storeU64Relaxed(base, ShOffConsumerAlive, 0)
+    # Run identity. Zero the whole field first: the file is freshly `ftruncate`d
+    # here, but a chain that is RE-STAMPED in place (recycling) must not be able
+    # to leave a tail of the previous runId behind the new length.
+    zeroMem(addr base[ShOffRunId], RunIdMaxBytes)
+    let rn = min(runId.len, RunIdMaxBytes)
+    if rn > 0: copyMem(addr base[ShOffRunId], unsafeAddr runId[0], rn)
+    storeU32Relaxed(base, ShOffRunIdLen, uint32(rn))
     for i in 0 ..< extraWords:
       storeU64Relaxed(base, ShOffExtraControl + i * 8, 0)
     storeU32Release(base, ShOffFormatVersion, fmtVersion)
     # Publish magic LAST (release): an attacher that sees the magic also sees the
     # fully-initialised header + zeroed slots/arena.
     storeU64Release(base, ShOffMagic, ShmGSetMagic)
+
+  proc headerRunId(base: ShmBase): string =
+    ## The chain's run identity out of a MAPPED header (shard0 is the
+    ## authoritative one). Bounds-checked: a length outside the field reads as
+    ## "no identity" rather than as arbitrary bytes.
+    let n = int(loadU32Acquire(base, ShOffRunIdLen))
+    if n <= 0 or n > RunIdMaxBytes: return ""
+    result = newString(n)
+    copyMem(addr result[0], addr base[ShOffRunId], n)
 
   proc headerValid(base: ShmBase; boot: uint64; fmtVersion: uint32): bool =
     loadU64Acquire(base, ShOffMagic) == ShmGSetMagic and
@@ -549,6 +630,11 @@ when shmGSetSupported:
   # sequence makes every temp name unique across threads.
   var gShardTmpSeq: uint64
 
+  # Process-global chain uniquifier (the `chainSeq` component of an anchor
+  # name). Atomic for the same reason as `gShardTmpSeq`: two host THREADS in one
+  # process would otherwise forge the same anchor name.
+  var gChainSeq: uint64
+
   proc appendShardFile[K](s: var ShmGSetT[K]; newIndex, newCap,
       newArenaCap: int): bool =
     ## Create shard `newIndex` if absent, publishing it fully-initialised under
@@ -605,13 +691,22 @@ when shmGSetSupported:
 
   # --- public API -----------------------------------------------------------
 
-  proc shardBasePrefix*(dir, appId, runId: string; boot, ownerPid: uint64): string =
-    ## The chain's base name; `shard{K}` is appended per shard. Encodes the
-    ## appId + runId + boot + owner pid as `dir/{appId}~{runId}.{boot}.{pid}`.
-    ## The `appId` scopes the reaper (one app never reaps another's segments);
-    ## boot + owner pid let it judge staleness (design spec §4.3.4). The reserved
-    ## `~` keeps the appId recoverable even if runId contains dots.
-    dir / (appId & AppIdSep & runId & "." & $boot & "." & $ownerPid)
+  proc shardBasePrefix*(dir, appId: string;
+      chainSeq, boot, ownerPid: uint64): string =
+    ## The chain's base name; `shard{K}` is appended per shard. Encodes ONLY
+    ## what the reaper needs — `dir/{appId}~{chainSeq}.{boot}.{pid}`: the appId
+    ## scopes it (one app never reaps another's segments) and boot + owner pid
+    ## let it judge staleness (design spec §4.3.4).
+    ##
+    ## `chainSeq` is an OPAQUE per-owner uniquifier, not an identity: it exists
+    ## only so one process can own several chains at once without them colliding
+    ## on disk. The run identity lives in shard0's header — see `runId`.
+    ##
+    ## The component layout is deliberately the same SHAPE as the pre-HM-1
+    ## `{appId}~{runId}.{boot}.{pid}`, so the reaper's `rsplit('.', 2)` finds
+    ## boot and pid in the same positions for a legacy chain as for a current
+    ## one and a legacy chain is still collected rather than skipped.
+    dir / (appId & AppIdSep & $chainSeq & "." & $boot & "." & $ownerPid)
 
   proc createSetT*[K](dir, appId, runId: string; keyPolicy: typedesc[K];
       shard0Cap = 1024; shard0ArenaCap = 256 * 1024): ShmGSetT[K] =
@@ -620,19 +715,37 @@ when shmGSetSupported:
     ## `path0` to producers via `REPRO_MONITOR_DEP_SHM`. `appId` tags the chain
     ## so only THIS app's reaper considers it (see `reapStaleSegments`); it must
     ## satisfy `validAppId`. `shard0Cap` MUST be a power of two.
+    ##
+    ## `runId` is the chain's identity and is written into shard0's HEADER, not
+    ## into any file name (see `shardBasePrefix`). It must satisfy `validRunId`;
+    ## it is otherwise unconstrained, and two chains of one app may share a runId
+    ## without colliding on disk.
     mixin keyFormatVersion, extraControlWords
     result.available = false
     result.isConsumer = true
     result.dir = dir
     result.boot = bootId()
     if not validAppId(appId): return
+    if not validRunId(runId): return
     if shard0Cap <= 0 or (shard0Cap and (shard0Cap - 1)) != 0: return
-    result.basePrefix = shardBasePrefix(dir, appId, runId, result.boot,
-      uint64(getpid()))
-    result.path0 = result.basePrefix & ".shard0"
     try:
       if dir.len > 0: createDir(dir)
     except CatchableError: return
+    # Claim an unused chain name. `chainSeq` carries no identity — it only keeps
+    # the chains of one owner distinct, which the name no longer gets for free
+    # from the runId. The `fileExists` retry also covers pid REUSE across a
+    # crashed run on the same boot: previously an identically-named leftover was
+    # silently overwritten by the rename below, taking its unreaped shards > 0
+    # with it.
+    var attempts = 0
+    while true:
+      let seqNo = atomicAddFetch(addr gChainSeq, 1'u64, ATOMIC_SEQ_CST)
+      result.basePrefix = shardBasePrefix(dir, appId, seqNo, result.boot,
+        uint64(getpid()))
+      result.path0 = result.basePrefix & ".shard0"
+      if not fileExists(result.path0): break
+      inc attempts
+      if attempts > 4096: return
     # Create shard0 via temp + atomic rename (a concurrent attacher never sees a
     # half-initialised file), with chainCount = 1.
     let extraWords = extraControlWords(K)
@@ -647,7 +760,7 @@ when shmGSetSupported:
     if base.isNil:
       discard close(tfd); discard unlink(tmp.cstring); return
     initShardHeader(base, 0, shard0Cap, shard0ArenaCap, result.boot, 1,
-      keyFormatVersion(K), extraWords)
+      keyFormatVersion(K), extraWords, runId)
     discard munmap(cast[pointer](base), size)
     discard close(tfd)
     try: moveFile(tmp, result.path0)
@@ -939,6 +1052,15 @@ when shmGSetSupported:
     if s.available and s.shards.len > 0 and not s.shards[0].base.isNil:
       storeU64Release(s.shards[0].base, ShOffConsumerAlive, 0)
 
+  proc runId*[K](s: ShmGSetT[K]): string =
+    ## The chain's RUN IDENTITY, read from shard0's header. Available to a
+    ## producer that only ever saw `path0` as well as to the owner, and it is the
+    ## single source of truth: no caller (the reaper included) may re-derive it
+    ## from a file name, which is what lets a chain be recycled and re-stamped
+    ## without renaming a file.
+    if not s.available or s.shards.len == 0 or s.shards[0].base.isNil: return ""
+    headerRunId(s.shards[0].base)
+
   proc consumerAlive*[K](s: ShmGSetT[K]): bool =
     ## Whether the host/consumer that owns shard0 is still registered as live
     ## (LF-4). The producer interface (`transport`) surfaces this as
@@ -1034,36 +1156,83 @@ when shmGSetSupported:
     if kill(Pid(pid), cint(0)) == 0: return true
     errno != ESRCH
 
-  proc reapStaleSegments*(dir, appId: string): int =
-    ## Cross-restart GC SCOPED TO ONE appId. Only anchors tagged with `appId`
-    ## (`{appId}~{runId}.{boot}.{pid}.shard0`) are considered; segments of any
-    ## OTHER appId are IGNORED entirely — never reaped, never even
-    ## liveness-checked — so one app cannot reap another's live/crashed segments
-    ## and cross-app pid reuse can no longer misfire. WITHIN the matching appId
-    ## the staleness rule is unchanged: reap the whole chain when boot !=
-    ## currentBoot (survived a reboot ⇒ pids meaningless) OR the owner pid is
-    ## dead on the current boot. A live-owner run is left alone. An
-    ## `flock(LOCK_EX|LOCK_NB)` on shard0 guards a run that is just starting.
-    ## Returns the number of shard FILES removed.
+  proc readAnchorRunId(anchor: string): tuple[fromHeader: bool; runId: string] =
+    ## Read a chain's RUN IDENTITY out of shard0's header with a plain bounded
+    ## `read` — nothing is mapped and no field is trusted. The reaper points this
+    ## at whatever files it finds in a shared directory, which include legacy
+    ## (pre-HM-1) chains, chains of another key discipline, truncated leftovers
+    ## and files that are not shards at all, so every one of those must read as
+    ## "no header identity" rather than as arbitrary bytes.
     ##
-    ## Key-discipline agnostic: staleness is judged from the anchor NAME and the
-    ## owner's liveness, never from the element encoding.
-    result = 0
-    if not validAppId(appId): return 0
+    ## The key-discipline version word is deliberately NOT checked: the runId
+    ## field sits at a fixed offset in the shared header layout, so the reaper
+    ## stays key-discipline agnostic and can attribute a chain written under any
+    ## policy.
+    result = (false, "")
+    let fd = open(anchor.cstring, O_RDONLY)
+    if fd < 0: return
+    var buf: array[ShardHeaderSize, byte]
+    var got = 0
+    while got < ShardHeaderSize:
+      let n = read(fd, addr buf[got], ShardHeaderSize - got)
+      if n <= 0: break
+      got += n
+    discard close(fd)
+    if got < ShardHeaderSize: return       # too small to carry a header
+    var magic: uint64
+    copyMem(addr magic, addr buf[ShOffMagic], 8)
+    if magic != ShmGSetMagic: return       # legacy layout, or not a shard
+    var rawLen: uint32
+    copyMem(addr rawLen, addr buf[ShOffRunIdLen], 4)
+    let n = int(rawLen)
+    if n > RunIdMaxBytes: return           # corrupt length: no identity
+    result.fromHeader = true
+    if n > 0:
+      result.runId = newString(n)
+      copyMem(addr result.runId[0], addr buf[ShOffRunId], n)
+
+  proc reapStaleSegmentsDetailed*(dir, appId: string): seq[ReapedSegment] =
+    ## `reapStaleSegments` with the ATTRIBUTION kept: one `ReapedSegment` per
+    ## chain collected, in the order they were collected.
+    ##
+    ## Scoping and staleness come from the anchor NAME
+    ## (`{appId}~{chainSeq}.{boot}.{pid}.shard0`), which is all the name carries.
+    ## IDENTITY comes from shard0's HEADER, read before anything is unlinked. The
+    ## two are deliberately separate: a chain that is recycled and re-stamped
+    ## keeps its name, so a name-derived runId would be stale, and a name-derived
+    ## runId cannot exist at all for a current chain.
+    ##
+    ## Only anchors tagged with `appId` are considered; segments of any OTHER
+    ## appId are IGNORED entirely — never reaped, never even liveness-checked —
+    ## so one app cannot reap another's live/crashed segments and cross-app pid
+    ## reuse cannot misfire. WITHIN the matching appId the staleness rule is
+    ## unchanged: reap the whole chain when boot != currentBoot (survived a
+    ## reboot ⇒ pids meaningless) OR the owner pid is dead on the current boot. A
+    ## live-owner run is left alone. An `flock(LOCK_EX|LOCK_NB)` on shard0 guards
+    ## a run that is just starting.
+    ##
+    ## MIGRATION: a chain written under the pre-HM-1 naming
+    ## (`{appId}~{runId}.{boot}.{pid}`) has the same component SHAPE, so it is
+    ## scoped, judged and COLLECTED by exactly this rule — never skipped and left
+    ## to leak. It cannot be attached any more (its header magic is the old
+    ## layout), so being collected once stale is the only outcome that does not
+    ## leak it. Its `runIdFromHeader` is false and its `runId` is the one the old
+    ## NAME carried, which is the only place a legacy chain has it.
+    if not validAppId(appId): return @[]
     let cur = bootId()
     var anchors: seq[string]
     try:
       for _, p in walkDir(dir):
         if extractFilename(p).endsWith(".shard0"): anchors.add p
-    except CatchableError: return 0
+    except CatchableError: return @[]
     for anchor in anchors:
       let name = extractFilename(anchor)
-      let stem = name[0 ..< name.len - ".shard0".len]  # appId~runId.boot.pid
+      let stem = name[0 ..< name.len - ".shard0".len]  # appId~chainSeq.boot.pid
       let sep = stem.find(AppIdSep)                    # first '~' ends the appId
       if sep < 0: continue                             # untagged / foreign anchor
       if stem[0 ..< sep] != appId: continue            # another app: leave alone
-      let rest = stem[sep + 1 .. ^1]                   # runId.boot.pid
-      let parts = rest.rsplit('.', 2)                  # [runId, boot, pid]
+      let rest = stem[sep + 1 .. ^1]                   # chainSeq.boot.pid
+      let parts = rest.rsplit('.', 2)                  # [chainSeq, boot, pid]
       if parts.len != 3: continue
       var boot, pid: uint64
       try:
@@ -1077,15 +1246,28 @@ when shmGSetSupported:
         let locked = flock(fd, LOCK_EX or LOCK_NB) == 0
         if not locked:
           discard close(fd); continue     # someone holds it: leave it
-      let base = dir / stem                # dir/runId.boot.pid
+      # Attribute BEFORE unlinking — the identity lives in the file.
+      let ident = readAnchorRunId(anchor)
+      var seg = ReapedSegment(anchor: anchor, boot: boot, ownerPid: pid,
+        runIdFromHeader: ident.fromHeader,
+        runId: (if ident.fromHeader: ident.runId else: parts[0]))
+      let base = dir / stem                # dir/{appId}~{chainSeq}.{boot}.{pid}
       var k = 0
       while true:
         let sp = base & ".shard" & $k
         if not fileExists(sp): break
-        try: removeFile(sp); inc result
+        try:
+          removeFile(sp); inc seg.filesRemoved
         except CatchableError: discard
         inc k
       if fd >= 0: discard close(fd)
+      result.add seg
+
+  proc reapStaleSegments*(dir, appId: string): int =
+    ## Cross-restart GC SCOPED TO ONE appId; returns the number of shard FILES
+    ## removed. See `reapStaleSegmentsDetailed` for the rule and for the
+    ## per-chain attribution.
+    for seg in reapStaleSegmentsDetailed(dir, appId): result += seg.filesRemoved
 
 else:
   # --- portable no-op arm ---------------------------------------------------
@@ -1106,8 +1288,9 @@ else:
   proc toBytesSeq*(v: ElemView): seq[byte] = @[]
 
   proc bootId*(): uint64 = 1'u64
-  proc shardBasePrefix*(dir, appId, runId: string; boot, ownerPid: uint64): string =
-    dir & "/" & appId & "~" & runId & "." & $boot & "." & $ownerPid
+  proc shardBasePrefix*(dir, appId: string;
+      chainSeq, boot, ownerPid: uint64): string =
+    dir & "/" & appId & "~" & $chainSeq & "." & $boot & "." & $ownerPid
   proc createSetT*[K](dir, appId, runId: string; keyPolicy: typedesc[K];
       shard0Cap = 1024; shard0ArenaCap = 256 * 1024): ShmGSetT[K] =
     ShmGSetT[K](available: false, dir: dir)
@@ -1137,10 +1320,12 @@ else:
   proc claimedSlots*[K](s: var ShmGSetT[K]): uint64 = 0
   proc growthFailures*[K](s: var ShmGSetT[K]): uint64 = 0
   proc markConsumerGone*[K](s: var ShmGSetT[K]) = discard
+  proc runId*[K](s: ShmGSetT[K]): string = ""
   proc consumerAlive*[K](s: ShmGSetT[K]): bool = false
   proc shardIsDrained*[K](s: var ShmGSetT[K]; k: int): bool = false
   proc markShardDrained*[K](s: var ShmGSetT[K]; k: int): bool {.discardable.} = false
   proc retireShard*[K](s: var ShmGSetT[K]; k: int): bool {.discardable.} = false
   proc assertNoAbsolutePointers*[K](s: var ShmGSetT[K]) = discard
   proc shards0Base*[K](s: ShmGSetT[K]): pointer = nil
+  proc reapStaleSegmentsDetailed*(dir, appId: string): seq[ReapedSegment] = @[]
   proc reapStaleSegments*(dir, appId: string): int = 0

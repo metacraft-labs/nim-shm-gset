@@ -45,9 +45,14 @@ regardless of write order, writer, or duplication.
 - **Reaper** (`reapStaleSegments(dir, appId)`): cross-restart GC of shard files
   whose owner is gone (boot-id + owner-pid staleness, `flock`-guarded against a
   starting run). SCOPED to one `appId`: anchors are named
-  `{appId}~{runId}.{boot}.{pid}.shardN`, and the reaper only considers its own
+  `{appId}~{chainSeq}.{boot}.{pid}.shardN`, and the reaper only considers its own
   app's anchors, so one application never reaps another's segments even when
-  they share a directory (the reserved `~` keeps the appId unambiguous).
+  they share a directory (the reserved `~` keeps the appId unambiguous). The
+  name carries only what SCOPING and STALENESS need — `chainSeq` is an opaque
+  per-owner uniquifier, not an identity. The run IDENTITY is a **header** field
+  (`reapStaleSegmentsDetailed` reports it per collected chain, `runId` reads it
+  off an attached chain), so a recycled chain is re-stamped in place and can
+  never carry a stale name-borne `runId`.
 - **Deterministic schedule hooks** (`-d:shmGSetScheduleHooks`): test-only seams
   at every CAS/publish site so interleavings can be driven deterministically.
 - **Portable no-op arm**: compiles everywhere; `shmGSetSupported == false` off
@@ -109,7 +114,8 @@ echo s.shardCount(), s.growthFailures()  # metrics; growthFailures>0 ⇒ mcIncom
 
 ## Reset and recycling
 
-**Status: designed, not implemented.** Motivated by hosting the monitor
+**Status: designed, not implemented — except for the identity change below,
+which has landed.** Motivated by hosting the monitor
 in-process (`reprobuild-specs/In-Process-Monitor-Hosting.md`): a long-lived
 daemon that owns the set can hand an already-grown chain to the next action
 instead of creating and growing a fresh one, so grow-only becomes an
@@ -171,15 +177,33 @@ becomes visible:
 - **Wraparound.** A 64-bit counter never wraps in practice; if a narrower word
   is used, wraparound must be handled rather than assumed away.
 
-### `runId` should move out of the filename
+### `runId` is out of the filename — **landed**
 
-Shards are named `{appId}~{runId}.{boot}.{pid}.shardN` and the reaper parses
-`runId` back out of the name. A recycled chain therefore either carries a
-**stale `runId`** — breaking reaper attribution and making the on-disk shards
-misreport which run produced them — or the files are renamed on every reuse,
-which gives back part of the saving. Decoupling the reaper's identity from the
-filename (header-only `runId`) is the cleaner fix and should be settled **before**
-recycling is built.
+Shards used to be named `{appId}~{runId}.{boot}.{pid}.shardN`, with the reaper
+splitting the run identity back out of the name. A recycled chain would then
+either carry a **stale `runId`** — breaking reaper attribution and making the
+on-disk shards misreport which run produced them — or have to be renamed on
+every reuse, giving back part of the saving.
+
+That is now decoupled, ahead of recycling as planned:
+
+- anchors are `{appId}~{chainSeq}.{boot}.{pid}.shardN`; the name carries only
+  what the reaper needs to SCOPE (`appId`) and to judge STALENESS (boot, owner
+  pid), plus an opaque `chainSeq` that keeps one owner's chains distinct and
+  carries no identity;
+- `runId` is a length-prefixed field in the shard header (`ShOffRunId`,
+  `RunIdMaxBytes` = 120), written by `createSetT` and authoritative in shard0 —
+  the field `reset` re-stamps in place;
+- `runId(chain)` reads it back (owner or attached producer), and
+  `reapStaleSegmentsDetailed` reports it per collected chain
+  (`runIdFromHeader` distinguishes a header read from the legacy fallback);
+- the header layout revision lives in the **magic** (`ShmGSetMagic`, revision 2)
+  rather than in each policy's `keyFormatVersion`, because the layout moved for
+  every key discipline at once;
+- a **legacy** chain (`ShmGSetMagicV1`, runId in the name) keeps the same name
+  SHAPE, so it is still scoped, judged and collected by the ordinary staleness
+  rule. It can no longer be attached, so being reaped once stale is the only
+  outcome that does not leak it.
 
 ### Verification obligations
 

@@ -85,6 +85,10 @@ proc startHost*(dir, runId: string; appId = "io-mon"; shard0Cap = 1024;
 
 proc available*(h: SetHost): bool = h.s.available
 proc path0*(h: SetHost): string = h.s.path0
+proc runId*(h: SetHost): string = h.s.runId
+  ## The chain's run identity, read back from shard0's HEADER (never from the
+  ## file name). A host that recycles a chain re-stamps this field, so it — not
+  ## the anchor's name — is what any consumer or reaper attributes evidence to.
 
 iterator items*(h: var SetHost): seq[byte] =
   ## Single-threaded merged distinct set (the depfile source of truth, §4.3.3).

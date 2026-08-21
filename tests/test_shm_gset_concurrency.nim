@@ -263,7 +263,7 @@ suite "reaper vs starting/active run (design spec §4.5(c))":
     # as a run that is just starting / actively owning shard0 would.
     let wrongBoot = bootId() + 1
     let livePid = uint64(getpid())
-    let stalePrefix = shardBasePrefix(dir, "io-mon", "startingRun", wrongBoot, livePid)
+    let stalePrefix = shardBasePrefix(dir, "io-mon", 1'u64, wrongBoot, livePid)
     let staleAnchor = stalePrefix & ".shard0"
     writeFile(staleAnchor, "starting-run shard0")
     check fileExists(staleAnchor)

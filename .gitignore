@@ -6,6 +6,7 @@ tests/test_shm_gset
 tests/test_shm_gset_hooks
 tests/test_shm_gset_transport
 tests/test_shm_gset_lf5
+tests/test_shm_gset_reaper_identity
 tests/test_shm_gset_concurrency
 tests/test_shm_gset_threads
 tests/test_shm_gset_soak
