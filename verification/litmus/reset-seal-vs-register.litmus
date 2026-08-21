@@ -1,0 +1,44 @@
+C reset-seal-vs-register
+(*
+ * nim-shm-gset RESET: the seal / producer-registry handshake
+ * (src/shm_gset.nim `reset` vs `attachSetT`), design spec §4.5(a), HM-2.
+ *
+ * This is the ONLY sequentially-consistent pair in the library, and it is a
+ * STORE-BUFFER (Dekker) shape rather than a message-passing one:
+ *
+ *   reset:    store the seal, THEN scan the producer registry.
+ *   attach:   claim a registry entry, THEN read the seal (and back out if set).
+ *
+ * The dangerous outcome is the one where NEITHER side sees the other: reset
+ * concludes the chain is quiescent while the producer concludes it attached
+ * cleanly. That producer then inserts under the generation reset is about to
+ * publish, and the finished action's bytes land in the next action's dependency
+ * set — the cross-attribution the whole milestone exists to prevent.
+ *
+ * SB is NOT forbidden by release/acquire, and it is NOT forbidden by x86-TSO
+ * either: the store buffer lets both stores sit unflushed while both loads read
+ * the old values. Only a total order over the four accesses forbids it, which is
+ * why these four (and only these four) are `memory_order_seq_cst`.
+ *
+ * `reg` is modelled as a plain seq_cst store rather than the CAS the code uses;
+ * a successful `compare_exchange` is a read-modify-write with the same seq_cst
+ * store, so the SB shape is identical.
+ *
+ * EXPECTED (x86-TSO, ARMv8, RISCV): "Never" -> Forbidden.
+ *)
+{
+  seal = 0;
+  reg  = 0;
+}
+
+P0 (atomic_int *seal, atomic_int *reg) {          (* reset *)
+  atomic_store_explicit(seal, 1, memory_order_seq_cst);
+  int r1 = atomic_load_explicit(reg, memory_order_seq_cst);
+}
+
+P1 (atomic_int *seal, atomic_int *reg) {          (* attachSetT *)
+  atomic_store_explicit(reg, 1, memory_order_seq_cst);
+  int r2 = atomic_load_explicit(seal, memory_order_seq_cst);
+}
+
+exists (0:r1=0 /\ 1:r2=0)

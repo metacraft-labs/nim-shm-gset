@@ -22,11 +22,22 @@ if ! command -v "$cc" >/dev/null 2>&1; then
   exit 127
 fi
 
-echo "== cross-compiling shm_gset_core for aarch64 (dynamic) =="
-"$cc" -std=c11 -O2 -pthread -DSTANDALONE -DNITER="$iters" "$here/shm_gset_core.c" -o "$out"
-file "$out" | head -1
-
 glibc="$(dirname "$(dirname "$("$cc" -print-file-name=libc.so.6)")")"
-echo "== running under qemu-aarch64 (FUNCTIONAL only — not weak-memory) =="
-QEMU_LD_PREFIX="$glibc" qemu-aarch64 -L "$glibc" "$out"
+
+run_core() {
+  src="$1"; bin="$2"; shift 2
+  echo "== cross-compiling $(basename "$src") for aarch64 (dynamic) $* =="
+  "$cc" -std=c11 -O2 -pthread -DSTANDALONE -DNITER="$iters" "$@" "$src" -o "$bin" || exit 1
+  file "$bin" | head -1
+  echo "== running under qemu-aarch64 (FUNCTIONAL only — not weak-memory) =="
+  QEMU_LD_PREFIX="$glibc" qemu-aarch64 -L "$glibc" "$bin"
+}
+
+run_core "$here/shm_gset_core.c" "$out"
+# HM-2: the reset/recycling core, plus its RELAXED_SEAL control. Note that the
+# control is expected to report ZERO straddles here: qemu-user does not
+# reproduce ARM's store buffer, so the control only demonstrates its point on
+# real hardware (see ../README.md for the x86-64 numbers) or under herd7.
+run_core "$here/shm_gset_reset_core.c" "${out}_reset"
+run_core "$here/shm_gset_reset_core.c" "${out}_reset_relaxed" -DRELAXED_SEAL
 echo "[OK] aarch64 functional run complete (qemu-user; NOT a weak-memory proof)"

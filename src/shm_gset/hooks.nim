@@ -26,7 +26,17 @@ type
                           ## the run directory under its final name
     spAfterShardLink      ## shard file linked; about to bump the chain count
     spBeforeChainBump     ## about to CAS shard0.chainCount n -> n+1
-    spBeforeArenaReserve  ## about to fetch-add the arena bump pointer
+    spBeforeArenaReserve  ## about to CAS the generation-stamped arena bump
+                          ## pointer (reserve or rebase)
+    # --- reset / recycling publish points (HM-2) ---
+    # These four bracket the ONLY writes `reset` performs, in the order it
+    # performs them, so a kill-injection harness can crash a host at each and
+    # assert the chain reads as fully-old or fully-new — never half-reset.
+    spBeforeRunIdStamp    ## about to stamp the NEXT generation's runId slot
+    spBeforeLivenessRearm ## runId stamped; about to re-arm the consumer token
+    spBeforeGenerationPublish ## everything staged; about to release-store the
+                          ## new generation — the atomic commit point
+    spAfterGenerationPublish  ## committed; about to drop the reset seal
 
   ScheduleHook* = proc (point: SchedulePoint) {.gcsafe, raises: [].}
 

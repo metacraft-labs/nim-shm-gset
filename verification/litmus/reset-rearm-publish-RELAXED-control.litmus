@@ -1,0 +1,29 @@
+C reset-rearm-publish-RELAXED-control
+(*
+ * CONTROL for reset-rearm-publish. Identical message-passing shape with the
+ * release/acquire DOWNGRADED to relaxed on both sides.
+ *
+ * This must be ALLOWED ("Sometimes") on a weak model (aarch64, riscv), which is
+ * what proves the shipped release/acquire in `reset` is LOAD-BEARING rather than
+ * decorative — the "passes on x86, faults on Apple silicon" trap. On x86-TSO it
+ * may still be forbidden, because TSO does not reorder store->store or
+ * load->load; that is precisely why the ARM and RISC-V models are run too.
+ *
+ * EXPECTED: Allowed ("Sometimes") on aarch64 and riscv.
+ *)
+{
+  alive = 0;
+  generation = 1;
+}
+
+P0 (int *alive, atomic_int *generation) {
+  *alive = 1;
+  atomic_store_explicit(generation, 2, memory_order_relaxed);  (* NOT release *)
+}
+
+P1 (int *alive, atomic_int *generation) {
+  int r1 = atomic_load_explicit(generation, memory_order_relaxed); (* NOT acquire *)
+  int r2 = *alive;
+}
+
+exists (1:r1=2 /\ 1:r2=0)

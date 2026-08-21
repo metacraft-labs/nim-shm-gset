@@ -1,0 +1,43 @@
+C reset-rearm-publish
+(*
+ * nim-shm-gset RESET: consumer-liveness re-arm -> generation publish
+ * (src/shm_gset.nim `reset` -> `consumerAlive` / `emit`), design spec
+ * io-mon-Lossless-Event-Capture §4.5(a), milestone HM-2.
+ *
+ * The SHIPPED release->acquire pair:
+ *   consumer (reset): re-arms the liveness token (ShOffConsumerAlive := 1,
+ *                     a plain/relaxed store), then publishes the new
+ *                     generation with ONE release store
+ *                     (storeU64Release ShOffGeneration).
+ *   producer:         acquire-loads the GENERATION first (headerGeneration,
+ *                     called from `consumerAlive` BEFORE it reads the token),
+ *                     and only then reads the liveness token.
+ *
+ * That read order is deliberate and is what this test pins. `markConsumerGone`
+ * leaves the token at 0 at the end of an action; `reset` re-arms it and then
+ * commits. A producer that could observe the NEW generation while still seeing
+ * the OLD, dead token would fast-fail every insert with `emConsumerGone` — no
+ * evidence, no error, and nobody watching. The MP shape below forbids exactly
+ * that reordering.
+ *
+ * MP shape: `generation` is the flag, `alive` is the data. Forbidden: the new
+ * generation observed while the token still reads gone.
+ *
+ * EXPECTED (x86-TSO, ARMv8, RISCV): "Never" -> Forbidden.
+ *)
+{
+  alive = 0;          (* markConsumerGone left it dead *)
+  generation = 1;
+}
+
+P0 (int *alive, atomic_int *generation) {
+  *alive = 1;                                                (* RE-ARM ... *)
+  atomic_store_explicit(generation, 2, memory_order_release); (* ... then COMMIT *)
+}
+
+P1 (int *alive, atomic_int *generation) {
+  int r1 = atomic_load_explicit(generation, memory_order_acquire); (* gen FIRST *)
+  int r2 = *alive;                                                 (* then token *)
+}
+
+exists (1:r1=2 /\ 1:r2=0)

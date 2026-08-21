@@ -1,0 +1,44 @@
+C reset-runid-stamp
+(*
+ * nim-shm-gset RESET: the run-identity re-stamp -> generation publish
+ * (src/shm_gset.nim `writeRunIdSlot` -> `headerRunId` / `readAnchorRunId`),
+ * design spec §4.5(a), HM-2.
+ *
+ * There are TWO runId slots, selected by the low bit of the generation. `reset`
+ * writes the slot the NEXT generation will select — never the one the current
+ * generation is being read from — and then publishes the generation with a
+ * release store. A reader acquire-loads the generation and only then picks and
+ * reads a slot.
+ *
+ * Two properties ride on this pair:
+ *
+ *   1. VISIBILITY. A reader that observes generation N+1 must observe the fully
+ *      written slot N+1, not a half-written one. That is the MP shape below.
+ *   2. CRASH ATOMICITY. Because the write goes to the OTHER slot, a crash any
+ *      time before the generation store leaves the chain reporting the OLD
+ *      identity with the OLD contents — fully-old, never half. A single in-place
+ *      runId field could not give that: the window between rewriting it and
+ *      bumping the generation is a chain whose finished action's contents carry
+ *      the NEXT action's identity.
+ *
+ * MP shape: `generation` is the flag, the next slot's length+bytes are the data.
+ * Forbidden: the new generation observed with the new slot still empty.
+ *
+ * EXPECTED (x86-TSO, ARMv8, RISCV): "Never" -> Forbidden.
+ *)
+{
+  slot1len = 0;
+  generation = 1;
+}
+
+P0 (int *slot1len, atomic_int *generation) {
+  *slot1len = 7;                                              (* stamp slot (N+1)&1 *)
+  atomic_store_explicit(generation, 2, memory_order_release); (* COMMIT *)
+}
+
+P1 (int *slot1len, atomic_int *generation) {
+  int r1 = atomic_load_explicit(generation, memory_order_acquire);
+  int r2 = *slot1len;                                         (* pick + read slot *)
+}
+
+exists (1:r1=2 /\ 1:r2=0)

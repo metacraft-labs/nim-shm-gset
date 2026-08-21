@@ -89,18 +89,32 @@ suite "A. the identity instantiation is bit-for-bit the pre-existing structure":
     # If a change to the key discipline or the header layout moves io-mon's
     # format, this test fails, which is the intended alarm.
     #
-    # RE-BASELINED ONCE, deliberately, when `runId` moved out of the shard file
-    # NAME and into the header (magic layout revision 1 → 2): the header grew
-    # from 128 to 256 bytes to carry the run identity, which shifts the slot
-    # array and the arena. The file SIZES are unchanged (the extra 128 bytes fit
-    # inside the existing 4 KiB alignment) and the shard COUNT is unchanged, so
-    # the alarm here is purely about content. The digests are a function of the
-    # runId too now, which is why this test fixes it at "goldenEdge".
+    # RE-BASELINED, deliberately, twice:
+    #
+    #  rev 1 → 2 (HM-1) — `runId` moved out of the shard file NAME and into the
+    #  header, growing it 128 → 256 bytes and shifting the slot array + arena.
+    #
+    #  rev 2 → 3 (HM-2, these digests) — every slot entry became GENERATION
+    #  STAMPED and the header grew 256 → 1472 bytes (the chain generation, the
+    #  two alternating runId slots, the producer registry, the attach counters).
+    #  Derived from the rev-2 bytes MECHANICALLY, not re-captured: magic low byte
+    #  2→3; slotsOff/arenaOff +1216 (the header delta, itself a multiple of 64,
+    #  so `alignUp(.,64)` shifts by exactly the same amount); the runId moved to
+    #  slot `generation and 1`; generation 1 in shard0's header and 0 in every
+    #  growth shard's (shard0 is authoritative); ArenaUsed and Occupied packed as
+    #  `(1 shl 32) or value`; every non-zero slot entry `off` → `(1 shl 32) or
+    #  (off + 1216)`; arena content relocated verbatim. Applying exactly that to
+    #  the rev-2 image reproduces all four files BYTE FOR BYTE, so nothing here
+    #  is unexplained.
+    #
+    # The file SIZES and the shard COUNT are unchanged across BOTH re-baselines
+    # (the extra header bytes fit inside the existing 4 KiB alignment), so the
+    # alarm this test raises is purely about content.
     const golden = [
-      (4096,   "06c43f2e2d75c1b908ae7acca19dbaa3b5a6ac36"),
-      (12288,  "ac1b082d5c6fa73d3bb43406e8a0947623066720"),
-      (45056,  "b7bbe8df566ff57030e39a6de5c335e90ac1c0e8"),
-      (167936, "691bedc2bc97b461d9f1bf22786d575c800f27ee")]
+      (4096,   "31f5c704895d81fc3448b3e52ff601e5c440d7fa"),
+      (12288,  "97be27c67a23e8795143b95b1108ca0ed4c909fa"),
+      (45056,  "464db6f8d446431eceb4f956e964997bcd817a82"),
+      (167936, "61eb08afd4ae4c52e3f64c765dde310d07a23af2")]
     let dir = freshDir("golden")
     defer: removeDir(dir)
     var s = createSet(dir, "io-mon", "goldenEdge", shard0Cap = 64,

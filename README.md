@@ -114,22 +114,28 @@ echo s.shardCount(), s.growthFailures()  # metrics; growthFailures>0 ⇒ mcIncom
 
 ## Reset and recycling
 
-**Status: designed, not implemented — except for the identity change below,
-which has landed.** Motivated by hosting the monitor
+**Status: IMPLEMENTED (`reset`).** Motivated by hosting the monitor
 in-process (`reprobuild-specs/In-Process-Monitor-Hosting.md`): a long-lived
 daemon that owns the set can hand an already-grown chain to the next action
 instead of creating and growing a fresh one, so grow-only becomes an
 amortisation rather than a per-action cost. A per-action monitor process cannot
 do this — it dies with its segment.
 
-The library should offer this directly: **one reset operation that recycles the
-OS shared memory into a fresh, empty gset**, so callers never open-code it.
+The library offers this directly: **one reset operation that recycles the OS
+shared memory into a fresh, empty gset**, so callers never open-code it.
 
 ```nim
-proc reset*(h: var SetHost; runId: string)
+proc reset*(h: var SetHost; runId: string): ResetStatus
   ## Recycle this chain into a FRESH empty set, reusing the mapped shards.
   ## Consumer-only. Requires quiescence (see below).
 ```
+
+The status is RETURNED, not a `void` with a documented precondition: the
+operation's defining property is that it can REFUSE (`rsBusyProducers`,
+`rsProducersUntracked`, `rsGenerationExhausted`, `rsNotConsumer`,
+`rsInvalidRunId`, `rsUnavailable`), and a refusal the caller cannot see is a
+precondition nobody enforces one call frame later. It is not `discardable`
+either.
 
 ### Generation-stamped, so reset is O(1)
 
@@ -137,12 +143,43 @@ The naive reset — zero the slot tables and the intern arena — costs
 O(*capacity*): what the chain **grew to**, not what the next action uses, so a
 small action recycling a large chain pays for the whole thing.
 
-Instead, stamp each slot with a generation and treat a slot as empty when
-`slot.gen != header.gen`. Reset is then a **single increment, O(1) at any chain
-size**. `extraControlWords` already exists for exactly this — it is documented
-as being for "a global generation counter". The arena bump pointer resets to 0;
-stale bytes stay resident but are unreachable, because no slot referencing them
-matches the current generation.
+Instead, each slot entry is generation-STAMPED: it packs
+`(generation shl 32) or offset`, and a slot is empty unless its stamp equals the
+chain's current generation. Reset is then a **single store, O(1) at any chain
+size** — measured flat at ~2 µs whether the chain has one shard or six (1.9 vs
+2.0 µs on an idle machine, 2.24 vs 2.23 µs on a loaded one: the absolute number
+moves, the two do not diverge) and
+asserted structurally by `reset_is_constant_time`, which shows reset writes
+nothing outside shard0's fixed header.
+
+The generation lives IN the entry rather than beside it so the claim stays a
+single-word CAS; a (generation, offset) pair in two words could not be claimed
+atomically, and a claim that is not atomic is a torn slot. The per-shard arena
+bump pointer, occupancy counter and growth-failure counter are stamped the same
+way, so each **rebases itself** on first use in a new generation and reset does
+not have to walk the chain to reclaim them either. Stale bytes stay resident but
+are unreachable, because no slot referencing them matches the current
+generation.
+
+Two bounds follow from the packing and are ENFORCED rather than assumed:
+a shard file may not reach `MaxShardBytes` (4 GiB — growth past it is a
+SIGNALLED saturation, never a truncated offset), and a chain may not be recycled
+more than `MaxGeneration` (2^32-1) times. On reaching the last generation
+`reset` returns `rsGenerationExhausted` and the caller creates a new chain.
+Wrapping would make a slot written 4.29e9 recycles ago read as live under the
+reused stamp, and the alternative — scrubbing every slot on wrap — is both
+O(capacity) and NOT crash-atomic, since it destroys the old contents before the
+commit point.
+
+The generation is a field of the FIXED header, not a policy-owned
+`extraControlWords` entry. The milestone assumed the latter (the doc comment on
+`extraControlWords` advertises "a global generation counter"), but it is the
+wrong hook here for two reasons: the extra control words are the POLICY's, and
+the keyed action-cache discipline already uses word 0 for its own tombstone
+generation, which the library would have had to steal; and reserving one for
+every discipline would shift the slot array for all of them a second time. The
+chain generation is a library-level concept that every key discipline needs, so
+it belongs in the header.
 
 This is also what makes recycling *correct* rather than merely cheap: entries
 from the previous action cannot be read back, so one action's dependencies can
@@ -159,23 +196,72 @@ prevent.
 The natural quiescence point is "the monitored process tree has fully exited".
 **That must be checked, not assumed.** The §4.1 incident is precisely a
 descendant that outlived its root and kept producing — the same class that makes
-reset dangerous. So `reset` MUST verify no live attached producers remain and
-**refuse** otherwise, rather than trusting the caller's lifecycle.
+reset dangerous. So `reset` verifies no live attached producers remain and
+**refuses** otherwise, rather than trusting the caller's lifecycle.
+
+The evidence lives in the chain: shard0 carries a **producer registry**
+(`MaxRegisteredProducers` pid entries). `attachSet` claims one and `detach`
+releases it; `reset` refuses while any registered pid is still alive
+(`attachedProducers` exposes the same predicate). A producer that dies without
+detaching leaves a dead pid, which is reclaimed by whoever next scans, so a
+crash does not make a chain permanently unrecyclable; pid REUSE can only make
+the scan see a live pid that is not really a producer, i.e. cause a spurious
+refusal, which is the conservative direction. A release only ever clears the
+CALLING process's own entry, which is what makes it fork-safe: io-mon's shim
+detaches the inherited handle in a fork CHILD and re-attaches under the child's
+own pid, and an unconditional clear there would deregister a parent that is
+still alive and producing. A producer that finds the registry
+full still attaches — never fail a producer for a bookkeeping reason — but
+counts itself in an overflow word, and `reset` refuses while that is nonzero,
+reporting `rsProducersUntracked` rather than `rsBusyProducers`. The distinction
+matters: a busy chain becomes recyclable again when those processes exit, but an
+UNTRACKED producer that dies without detaching leaves a count that never falls,
+so a pool must retire that chain instead of retrying it. Reporting both the same
+way would let a chain quietly stop recycling forever.
+
+Checking is not enough on its own, and this is the part the TLA+ model caught:
+a producer can attach in the window BETWEEN the check and the commit, and then
+insert under the new generation. So the check is bracketed by a **seal**. Reset
+stores the seal and then scans the registry; an attaching producer claims its
+registry entry and then reads the seal, backing out if it is set. That is a
+store-buffer (Dekker) shape, and "neither side sees the other" is permitted by
+release/acquire AND by x86-TSO — so those four accesses, and only those four,
+are sequentially consistent. Removing the seal from the model violates the
+no-cross-generation-leakage invariant; downgrading it to release/acquire in the
+C11 core reproduces the leak on real x86-64 hardware.
+
+**This is the case for the §4.5 tier, and it is worth stating plainly.** The
+quiescence check passes every functional test that can be written for it: the
+chain really is quiescent when it is checked, every producer really has exited,
+and a test can only observe the states the implementation lets it reach. The
+model found the hole because it explores the interleaving where a producer
+attaches AFTER the check and BEFORE the commit — a window a few instructions
+wide that no functional test would ever have hit, and whose consequence is not a
+crash but a silently wrong dependency set. The seal, the one `seq_cst` pair in
+the library, exists because of a TLC counterexample, not because of a red test.
 
 ### Ordering and the atomic commit point
 
 The generation bump is the commit. Everything else must be ordered **before** it
 becomes visible:
 
-- **Re-arm the consumer-liveness token.** `finish` calls `markConsumerGone`,
-  which is terminal; a recycled chain whose token is still "gone" makes every
-  producer on the next action fast-fail with `emConsumerGone` — monitored by
-  nobody, silently. Re-arm first, publish the generation second, or a producer
-  attaching to the new generation can observe a dead consumer.
+- **Re-arm the consumer-liveness token.** `markConsumerGone` used to be
+  terminal; a recycled chain whose token is still "gone" makes every producer on
+  the next action fast-fail with `emConsumerGone` — monitored by nobody,
+  silently. Reset re-arms it and only then publishes the generation, and
+  `consumerAlive` acquire-loads the GENERATION first and the token second, so
+  observing the new generation implies observing the re-armed token. (The
+  transport now also exposes `markConsumerGone` on its own, so an action can be
+  ended without tearing the chain down.)
 - **Crash mid-reset must leave the chain fully-old or fully-new**, never half.
-  A single release-store of the generation gives that.
-- **Wraparound.** A 64-bit counter never wraps in practice; if a narrower word
-  is used, wraparound must be handled rather than assumed away.
+  A single release-store of the generation gives that — including for the
+  IDENTITY, which is why there are **two runId slots** selected by
+  `generation and 1`. Reset stamps the slot the NEXT generation will select,
+  never the one currently being read, so a crash before the commit leaves the
+  old identity on the old contents. A single in-place field could not: the
+  window between rewriting it and bumping the generation is a chain whose
+  finished action's contents carry the next action's identity.
+- **Wraparound** is refused rather than risked — see above.
 
 ### `runId` is out of the filename — **landed**
 
@@ -205,12 +291,46 @@ That is now decoupled, ahead of recycling as planned:
   rule. It can no longer be attached, so being reaped once stale is the only
   outcome that does not leak it.
 
+### Version skew is diagnosable
+
+A header layout revision has now moved twice, and the first time it broke
+SILENTLY: a producer built against the other revision simply reported
+"unavailable", the edge graded `mcIncomplete`, and the dependency set came back
+EMPTY with no error anywhere. Conservative — never a false cache hit — but
+invisible. Three surfaces now make it legible, without changing that
+conservative behaviour:
+
+- `attachFailure` on `ShmGSetT` / `SetProducer` names WHY an attach failed, and
+  `afLayoutSkew` (a genuine shm_gset shard of another header layout revision) is
+  a different answer from `afNotAShard`, `afWrongBoot`, `afKeyDisciplineSkew`,
+  `afMissing`, `afTruncated`, `afRecycling`. It is a QUERY and not a new
+  `EmitStatus` value on purpose: consumers `case` over `EmitStatus`
+  exhaustively, so a new value there would break their build rather than inform
+  it.
+- `shardLayoutRevision(path)` answers "which revision wrote this file?" for
+  anyone, from the path alone, reading only the magic at offset 0 — whose
+  position and frozen high bytes (`ShmGSetMagicBase`) are the one thing common
+  to every revision.
+- `producerAttaches` is the HOST-side half, and the only one that can see the
+  direction that actually bit: a producer built against an OLDER layout cannot
+  report into a file whose shape it does not know, so what is observable is what
+  it never did. *elements == 0 AND producerAttaches == 0*, for an action that
+  spawned processes, is the fingerprint of a skewed (or un-injected) producer;
+  *elements == 0 AND producerAttaches > 0* means the producers really did attach
+  and really did observe nothing. It is generation-stamped, so a recycled chain
+  starts the count clean.
+
+Honest limit: a build that predates a diagnostic cannot emit it, so the
+`attachFailure`/`shardLayoutRevision` pair is effective from revision 3 forward
+and in both directions between any two revisions that have it.
+
 ### Verification obligations
 
 Reset is a lock-free, multi-process, weak-memory, crash-exposed operation, so it
 enters the **same §4.5 regime as `insert`** — functional tests alone are
 insufficient, and the model-checked core must be the shipped compilation unit.
-Additions, one per hazard above:
+Additions, one per hazard above (see `verification/README.md` for what RAN and
+what could not):
 
 - **TLA+** — two new safety invariants: *no element inserted before reset N is
   ever visible after reset N* (no cross-generation leakage), and *no element
@@ -229,6 +349,26 @@ Additions, one per hazard above:
   is that each generation's union equals exactly its intended set. This is the
   end-to-end proof that recycling cannot cross-attribute.
 - **ARM64 as well as x86**, per §4.5.
+
+The artifacts are all in place: `tests/test_shm_gset_reset.nim` (16 cases, real
+forked producers, a `setsid`-detached grandchild, real `SIGKILL` at every publish
+point), `tests/test_shm_gset_version_skew.nim` + `tests/helpers/v2_producer.nim`
+(a separate binary speaking the rev-2 contract, because a version skew is a
+disagreement between two BUILDS), `verification/tla/shm_gset_reset.tla`,
+`verification/core/shm_gset_reset_core.c` (+ its `-DRELAXED_SEAL` control) and
+`verification/litmus/reset-*.litmus`.
+
+Two of them are NOT satisfied, and saying so is the point of listing them:
+
+- **GenMC / CDSChecker and herd7 are absent from this nixpkgs pin**, so the
+  stateless-model-checking and litmus artifacts are AUTHORED, NOT RUN. The exact
+  failing `nix eval` attempts are recorded in `verification/README.md`.
+- **The ARM64 arm is not met.** `just verify-aarch64` cross-builds and runs every
+  C11 core under `qemu-user`, which does **not** reproduce ARMv8 weak memory — it
+  is a functional check (ABI, lowering, logic), and the `-DRELAXED_SEAL` control
+  reports ZERO there while reporting real failures on x86-64 hardware, which is
+  exactly how you can tell qemu is not modelling the store buffer. Real ARM64
+  weak-memory coverage needs real hardware or herd7.
 
 ## Test & benchmark
 

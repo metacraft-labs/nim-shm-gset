@@ -9,9 +9,18 @@
 # the pinned nixpkgs — see verification/README.md. Author-not-run until then.)
 #
 # For each shipped-ordering test the `exists` clause must be FORBIDDEN ("Never")
-# on every model. The RELAXED-control test must be ALLOWED ("Sometimes") on a
-# weak model (aarch64/riscv) — that is the whole point: it shows the shipped
-# release/acquire is load-bearing.
+# on every model. The *-RELAXED-control tests must be ALLOWED ("Sometimes") —
+# that is the whole point: they show the shipped ordering is load-bearing.
+#
+# Two different expectations among the controls, and the difference matters:
+#   * the MESSAGE-PASSING controls (slot-publish, reset-rearm-publish) are
+#     allowed on a WEAK model (aarch64/riscv) and may still be forbidden on
+#     x86-TSO — the classic "passes on x86, faults on Apple silicon" trap;
+#   * reset-seal-vs-register-RELAXED-control is a STORE-BUFFER shape and is
+#     allowed on EVERY model INCLUDING x86. That is why the seal/registry
+#     handshake is the one sequentially-consistent pair in the library, and it
+#     is also reproducible on real x86-64 hardware — see
+#     ../core/shm_gset_reset_core.c built with -DRELAXED_SEAL.
 set -uo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 models=("${@:-x86 aarch64 riscv}")

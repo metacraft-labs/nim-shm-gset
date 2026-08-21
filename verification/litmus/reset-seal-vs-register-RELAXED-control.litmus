@@ -1,0 +1,35 @@
+C reset-seal-vs-register-RELAXED-control
+(*
+ * CONTROL for reset-seal-vs-register. The same store-buffer shape with the
+ * seq_cst downgraded to release/acquire — the ordering the rest of the library
+ * uses everywhere else.
+ *
+ * This must be ALLOWED ("Sometimes") on EVERY model, including x86-TSO. That is
+ * the whole reason the shipped handshake is sequentially consistent: unlike the
+ * message-passing pairs, this one is not saved by TSO, so the usual "it works on
+ * x86" intuition is actively wrong here.
+ *
+ * It is also the one control in this directory that has been DEMONSTRATED on
+ * real hardware rather than only modelled: `../core/shm_gset_reset_core.c` built
+ * with `-DRELAXED_SEAL` reproduces the straddle and the resulting
+ * cross-generation leak on x86-64 within 100k barrier-synchronised runs, while
+ * the shipped build shows zero. See ../README.md.
+ *
+ * EXPECTED: Allowed ("Sometimes") on x86, aarch64 and riscv.
+ *)
+{
+  seal = 0;
+  reg  = 0;
+}
+
+P0 (atomic_int *seal, atomic_int *reg) {          (* reset *)
+  atomic_store_explicit(seal, 1, memory_order_release);
+  int r1 = atomic_load_explicit(reg, memory_order_acquire);
+}
+
+P1 (atomic_int *seal, atomic_int *reg) {          (* attachSetT *)
+  atomic_store_explicit(reg, 1, memory_order_release);
+  int r2 = atomic_load_explicit(seal, memory_order_acquire);
+}
+
+exists (0:r1=0 /\ 1:r2=0)

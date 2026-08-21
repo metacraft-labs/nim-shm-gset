@@ -7,6 +7,9 @@ tests/test_shm_gset_hooks
 tests/test_shm_gset_transport
 tests/test_shm_gset_lf5
 tests/test_shm_gset_reaper_identity
+tests/test_shm_gset_reset
+tests/test_shm_gset_version_skew
+tests/helpers/v2_producer
 tests/test_shm_gset_concurrency
 tests/test_shm_gset_threads
 tests/test_shm_gset_soak
@@ -21,3 +24,4 @@ verification/tla/*.st
 verification/core/*.o
 verification/core/shm_gset_core_run
 verification/core/shm_gset_core_aarch64
+verification/core/shm_gset_reset_core_run

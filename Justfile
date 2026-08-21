@@ -16,6 +16,20 @@ test:
     # header attribution, appId scoping, both staleness axes, and migration of a
     # chain written under the pre-HM-1 naming + header layout.
     nim c -r {{nim_flags}} tests/test_shm_gset_reaper_identity.nim
+    # Reset / recycling: generation-stamped O(1) recycling, the quiescence
+    # refusal (including a detached descendant that outlived its root), the
+    # liveness re-arm, and SIGKILL at every one of reset's publish points.
+    # -d:shmGSetScheduleHooks is REQUIRED, not decorative: the kill-injection
+    # cases need the seams and the generation-exhaustion case needs the
+    # test-only counter seam. Without it the file does not compile, so it cannot
+    # silently degrade into a weaker run.
+    nim c -r {{nim_flags}} -d:shmGSetScheduleHooks tests/test_shm_gset_reset.nim
+    # Version-skew diagnostic. The rev-2 PEER is a separate binary on purpose —
+    # a version skew is a disagreement between two BUILDS, so it cannot be
+    # exercised from inside one. Build it first; the test fails loudly (never
+    # skips) if it is absent.
+    nim c {{nim_flags}} -o:tests/helpers/v2_producer tests/helpers/v2_producer.nim
+    nim c -r {{nim_flags}} tests/test_shm_gset_version_skew.nim
     nim c -r {{nim_flags}} -d:shmGSetScheduleHooks tests/test_shm_gset_hooks.nim
     nim c -r {{nim_flags}} -d:shmGSetScheduleHooks tests/test_shm_gset_concurrency.nim
     nim c -r {{nim_flags}} tests/test_shm_gset_threads.nim
@@ -94,6 +108,38 @@ verify-tla:
     # Flatten (copy forward -> drain -> retire) racing a concurrent reader.
     cd verification/tla && nix shell nixpkgs#tlaplus --command \
         tlc -workers 4 -config shm_gset_keyed_flat_MC.cfg shm_gset_keyed_flat_MC.tla
+    # RESET / RECYCLING (HM-2): generation-stamped slots, the quiescence refusal
+    # and its seal, and the liveness re-arm ordered before the commit. Checks
+    # no cross-generation leakage, no loss after a reset, and that the liveness
+    # token is never gone under a generation that is accepting inserts.
+    cd verification/tla && nix shell nixpkgs#tlaplus --command \
+        tlc -workers 4 -config shm_gset_reset_MC.cfg shm_gset_reset_MC.tla
+
+# The C11 atomics cores (design spec §4.5(a)) as a native functional smoke, plus
+# the RELAXED_SEAL control. The control is expected to REPORT straddles and
+# cross-generation leaks — that is what shows the shipped seq_cst seal/registry
+# handshake is load-bearing rather than decorative — so it never fails the
+# build; only the SHIPPED build's oracles are hard assertions.
+verify-core:
+    cc -std=c11 -O2 -pthread -DSTANDALONE \
+        -o /tmp/shm_gset_core_run verification/core/shm_gset_core.c
+    /tmp/shm_gset_core_run
+    cc -std=c11 -O2 -pthread -DSTANDALONE -DNITER=100000 \
+        -o /tmp/shm_gset_reset_core_run verification/core/shm_gset_reset_core.c
+    /tmp/shm_gset_reset_core_run
+    cc -std=c11 -O2 -pthread -DSTANDALONE -DNITER=100000 -DRELAXED_SEAL \
+        -o /tmp/shm_gset_reset_core_relaxed verification/core/shm_gset_reset_core.c
+    /tmp/shm_gset_reset_core_relaxed
+    cc -std=c11 -O1 -g -pthread -fsanitize=thread -DSTANDALONE -DNITER=2000 \
+        -o /tmp/shm_gset_reset_core_tsan verification/core/shm_gset_reset_core.c
+    TSAN_OPTIONS="halt_on_error=1" /tmp/shm_gset_reset_core_tsan
+
+# Cross-build + run every C11 core for aarch64 under qemu-user (design spec §4.5
+# ARM64 arm). FUNCTIONAL ONLY — qemu-user does not reproduce ARMv8 weak memory.
+verify-aarch64:
+    nix shell nixpkgs#pkgsCross.aarch64-multiplatform.buildPackages.gcc \
+        nixpkgs#pkgsCross.aarch64-multiplatform.glibc \
+        --command verification/core/build-aarch64-qemu.sh
 
 # rr chaos-mode record + deterministic replay of the multi-process fork oracle
 # (design spec §4.5(f)). Explores rare fork/grow interleavings under a randomised

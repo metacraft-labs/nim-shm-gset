@@ -18,6 +18,24 @@ task test, "Build + run the nim-shm-gset test suite":
   # chain written under the pre-HM-1 naming + header layout.
   exec "nim c -r --hints:off --threads:on --warning:BareExcept:off " &
     "tests/test_shm_gset_reaper_identity.nim"
+  # Reset / recycling (HM-2): generation-stamped O(1) recycling, the quiescence
+  # refusal (including a detached descendant that outlived its root), the
+  # consumer-liveness re-arm, and SIGKILL at every one of reset's publish
+  # points. `-d:shmGSetScheduleHooks` is REQUIRED, not decorative — the file
+  # does not compile without the kill-injection seams and the generation seam,
+  # so this cannot silently degrade into a weaker run. Must stay in step with
+  # the Justfile `test` recipe.
+  exec "nim c -r --hints:off --threads:on --warning:BareExcept:off " &
+    "-d:shmGSetScheduleHooks tests/test_shm_gset_reset.nim"
+  # Version-skew diagnostic (HM-2). The rev-2 PEER is a SEPARATE binary on
+  # purpose: a version skew is a disagreement between two builds and cannot be
+  # exercised from inside one. Build it first; the test fails loudly (never
+  # skips) if it is missing. `--path:tests` picks up the keyed reference policy
+  # the `afKeyDisciplineSkew` case needs.
+  exec "nim c --hints:off --threads:on --warning:BareExcept:off " &
+    "-o:tests/helpers/v2_producer tests/helpers/v2_producer.nim"
+  exec "nim c -r --hints:off --threads:on --warning:BareExcept:off " &
+    "--path:tests tests/test_shm_gset_version_skew.nim"
   # The same suite compiled with the deterministic schedule hooks enabled, to
   # prove the test-only seams compile and stay behaviour-preserving.
   exec "nim c -r --hints:off --threads:on --warning:BareExcept:off " &
