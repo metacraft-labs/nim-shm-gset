@@ -107,6 +107,105 @@ for element in s.items: ...
 echo s.shardCount(), s.growthFailures()  # metrics; growthFailures>0 ⇒ mcIncomplete
 ```
 
+## Reset and recycling
+
+**Status: designed, not implemented.** Motivated by hosting the monitor
+in-process (`reprobuild-specs/In-Process-Monitor-Hosting.md`): a long-lived
+daemon that owns the set can hand an already-grown chain to the next action
+instead of creating and growing a fresh one, so grow-only becomes an
+amortisation rather than a per-action cost. A per-action monitor process cannot
+do this — it dies with its segment.
+
+The library should offer this directly: **one reset operation that recycles the
+OS shared memory into a fresh, empty gset**, so callers never open-code it.
+
+```nim
+proc reset*(h: var SetHost; runId: string)
+  ## Recycle this chain into a FRESH empty set, reusing the mapped shards.
+  ## Consumer-only. Requires quiescence (see below).
+```
+
+### Generation-stamped, so reset is O(1)
+
+The naive reset — zero the slot tables and the intern arena — costs
+O(*capacity*): what the chain **grew to**, not what the next action uses, so a
+small action recycling a large chain pays for the whole thing.
+
+Instead, stamp each slot with a generation and treat a slot as empty when
+`slot.gen != header.gen`. Reset is then a **single increment, O(1) at any chain
+size**. `extraControlWords` already exists for exactly this — it is documented
+as being for "a global generation counter". The arena bump pointer resets to 0;
+stale bytes stay resident but are unreachable, because no slot referencing them
+matches the current generation.
+
+This is also what makes recycling *correct* rather than merely cheap: entries
+from the previous action cannot be read back, so one action's dependencies can
+never be attributed to another.
+
+### The quiescence precondition is the crux
+
+Reset is sound only when **no producer can be mid-insert**. A producer sitting
+between its arena reserve and its slot publish when the generation flips would
+land bytes in the recycled set, and they would be attributed to the *next*
+action — a wrong dependency set, the cardinal sin this library exists to
+prevent.
+
+The natural quiescence point is "the monitored process tree has fully exited".
+**That must be checked, not assumed.** The §4.1 incident is precisely a
+descendant that outlived its root and kept producing — the same class that makes
+reset dangerous. So `reset` MUST verify no live attached producers remain and
+**refuse** otherwise, rather than trusting the caller's lifecycle.
+
+### Ordering and the atomic commit point
+
+The generation bump is the commit. Everything else must be ordered **before** it
+becomes visible:
+
+- **Re-arm the consumer-liveness token.** `finish` calls `markConsumerGone`,
+  which is terminal; a recycled chain whose token is still "gone" makes every
+  producer on the next action fast-fail with `emConsumerGone` — monitored by
+  nobody, silently. Re-arm first, publish the generation second, or a producer
+  attaching to the new generation can observe a dead consumer.
+- **Crash mid-reset must leave the chain fully-old or fully-new**, never half.
+  A single release-store of the generation gives that.
+- **Wraparound.** A 64-bit counter never wraps in practice; if a narrower word
+  is used, wraparound must be handled rather than assumed away.
+
+### `runId` should move out of the filename
+
+Shards are named `{appId}~{runId}.{boot}.{pid}.shardN` and the reaper parses
+`runId` back out of the name. A recycled chain therefore either carries a
+**stale `runId`** — breaking reaper attribution and making the on-disk shards
+misreport which run produced them — or the files are renamed on every reuse,
+which gives back part of the saving. Decoupling the reaper's identity from the
+filename (header-only `runId`) is the cleaner fix and should be settled **before**
+recycling is built.
+
+### Verification obligations
+
+Reset is a lock-free, multi-process, weak-memory, crash-exposed operation, so it
+enters the **same §4.5 regime as `insert`** — functional tests alone are
+insufficient, and the model-checked core must be the shipped compilation unit.
+Additions, one per hazard above:
+
+- **TLA+** — two new safety invariants: *no element inserted before reset N is
+  ever visible after reset N* (no cross-generation leakage), and *no element
+  inserted after reset N is lost*. Plus: the liveness token is never observable
+  as gone under the current generation.
+- **GenMC / CDSChecker** — generation bump racing concurrent inserts on a tiny
+  forced-collision table; exhaustive over C11 reorderings.
+- **Litmus (`herd7`)** — the liveness-rearm → generation-publish release/acquire
+  pair, per architecture model, alongside the existing four.
+- **Quiescence refusal** — assert `reset` actually REFUSES with a live attached
+  producer, including a detached/daemonized descendant that outlived its root.
+  A precondition nobody enforces is a comment.
+- **Kill injection mid-reset**, at every publish point: the chain reads as
+  fully-old or fully-new, never half, and no shard file leaks.
+- **Recycle soak** — N successive recycles with disjoint input sets; the oracle
+  is that each generation's union equals exactly its intended set. This is the
+  end-to-end proof that recycling cannot cross-attribute.
+- **ARM64 as well as x86**, per §4.5.
+
 ## Test & benchmark
 
 ```bash
