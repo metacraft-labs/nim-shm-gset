@@ -1,0 +1,26 @@
+AArch64 shm-gset-MP-relaxed-CONTROL
+(*
+ * CONTROL for MP-shipped.AArch64.litmus. Same shape, with the release store
+ * downgraded to a plain STR and the acquire load to a plain LDR — i.e. what
+ * `memory_order_relaxed` lowers to on ARMv8.
+ *
+ * This is the ARMv8 half of the "passes on x86, faults on Apple silicon" trap:
+ * the SAME C source, compiled for x86-64, produces an instruction sequence that
+ * x86-TSO forbids this outcome for (see MP-both-lowerings.X86.litmus), while
+ * ARMv8 permits it. A test suite run only on x86 cannot tell the two apart.
+ *
+ * EXPECTED: "Sometimes" -> ALLOWED on aarch64.cat. If this were Forbidden the
+ * shipped STLR/LDAR would be decoration and MP-shipped would prove nothing.
+ *)
+{
+0:X1=data0; 0:X2=data1; 0:X3=flag;
+1:X1=flag;  1:X2=data0; 1:X3=data1;
+}
+ P0            | P1            ;
+ MOV W0,#42    | LDR W0,[X1]   ;
+ STR W0,[X1]   | LDR W4,[X2]   ;
+ MOV W4,#7     | LDR W5,[X3]   ;
+ STR W4,[X2]   |               ;
+ MOV W5,#1     |               ;
+ STR W5,[X3]   |               ;
+exists (1:X0=1 /\ (1:X4=0 \/ 1:X5=0))

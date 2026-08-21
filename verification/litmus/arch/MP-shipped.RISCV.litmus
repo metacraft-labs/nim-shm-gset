@@ -1,0 +1,24 @@
+RISCV shm-gset-MP-shipped
+(*
+ * RISC-V leg of the nim-shm-gset publish->follow pairs (design spec §4.5(a)).
+ * See MP-shipped.AArch64.litmus for why the per-architecture files exist at all.
+ *
+ * LOWERING. RISC-V's RVWMO lowers the shipped C11 orders to explicit fences:
+ *   memory_order_release store -> fence rw,w ; sw
+ *   memory_order_acquire load  -> lw ; fence r,rw
+ *
+ * EXPECTED: "Never" -> Forbidden on riscv.cat.
+ *)
+{
+0:x5=data0; 0:x6=data1; 0:x7=flag;
+1:x5=flag;  1:x6=data0; 1:x7=data1;
+}
+ P0                | P1                ;
+ ori x1,x0,42      | lw x1,0(x5)       ;
+ sw x1,0(x5)       | fence r,rw        ;
+ ori x2,x0,7       | lw x2,0(x6)       ;
+ sw x2,0(x6)       | lw x3,0(x7)       ;
+ fence rw,w        |                   ;
+ ori x3,x0,1       |                   ;
+ sw x3,0(x7)       |                   ;
+exists (1:x1=1 /\ (1:x2=0 \/ 1:x3=0))

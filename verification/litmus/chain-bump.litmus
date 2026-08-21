@@ -24,13 +24,13 @@ C chain-bump
 }
 
 P0 (int *new_shard, atomic_int *chainCount) {
-  *new_shard = 1;                                            (* shard linked+init *)
-  atomic_store_explicit(chainCount, 2, memory_order_release); (* bump N -> N+1 *)
+  *new_shard = 1;                                            /* shard linked+init */
+  atomic_store_explicit(chainCount, 2, memory_order_release); /* bump N -> N+1 */
 }
 
 P1 (int *new_shard, atomic_int *chainCount) {
   int r1 = atomic_load_explicit(chainCount, memory_order_acquire);
-  int r2 = *new_shard;                                       (* open the shard *)
+  int r2 = *new_shard;                                       /* open the shard */
 }
 
 exists (1:r1=2 /\ 1:r2=0)

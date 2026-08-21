@@ -1,0 +1,27 @@
+AArch64 shm-gset-SB-sc-shipped
+(*
+ * ARMv8 leg of the seal / producer-registry handshake (`reset` vs
+ * `attachSetT`), the ONE sequentially-consistent pair in the library. Store
+ * buffer (Dekker) shape, not message passing:
+ *
+ *   reset:  store the seal, THEN load the registry.
+ *   attach: store the registry entry, THEN load the seal.
+ *
+ * The outcome to forbid is the one where NEITHER side sees the other, which is
+ * the cross-attribution the whole HM-2 milestone exists to prevent.
+ *
+ * LOWERING. `memory_order_seq_cst` store -> STLR, seq_cst load -> LDAR. ARMv8's
+ * STLR/LDAR are RCsc, and STLR->LDAR to different addresses may not be
+ * reordered, so a total order over the four accesses does exist.
+ *
+ * EXPECTED: "Never" -> Forbidden on aarch64.cat.
+ *)
+{
+0:X1=seal; 0:X3=reg;
+1:X1=reg;  1:X3=seal;
+}
+ P0            | P1            ;
+ MOV W0,#1     | MOV W0,#1     ;
+ STLR W0,[X1]  | STLR W0,[X1]  ;
+ LDAR W2,[X3]  | LDAR W2,[X3]  ;
+exists (0:X2=0 /\ 1:X2=0)

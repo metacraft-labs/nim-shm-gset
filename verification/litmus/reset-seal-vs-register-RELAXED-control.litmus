@@ -22,12 +22,12 @@ C reset-seal-vs-register-RELAXED-control
   reg  = 0;
 }
 
-P0 (atomic_int *seal, atomic_int *reg) {          (* reset *)
+P0 (atomic_int *seal, atomic_int *reg) {          /* reset */
   atomic_store_explicit(seal, 1, memory_order_release);
   int r1 = atomic_load_explicit(reg, memory_order_acquire);
 }
 
-P1 (atomic_int *seal, atomic_int *reg) {          (* attachSetT *)
+P1 (atomic_int *seal, atomic_int *reg) {          /* attachSetT */
   atomic_store_explicit(reg, 1, memory_order_release);
   int r2 = atomic_load_explicit(seal, memory_order_acquire);
 }

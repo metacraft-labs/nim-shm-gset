@@ -25,13 +25,13 @@ C shard-link
 }
 
 P0 (int *shard_hdr, atomic_int *linked) {
-  *shard_hdr = 1;                                           (* initShardHeader *)
-  atomic_store_explicit(linked, 1, memory_order_release);   (* link() publishes *)
+  *shard_hdr = 1;                                           /* initShardHeader */
+  atomic_store_explicit(linked, 1, memory_order_release);   /* link() publishes */
 }
 
 P1 (int *shard_hdr, atomic_int *linked) {
-  int r1 = atomic_load_explicit(linked, memory_order_acquire); (* observe file *)
-  int r2 = *shard_hdr;                                         (* map + read hdr *)
+  int r1 = atomic_load_explicit(linked, memory_order_acquire); /* observe file */
+  int r2 = *shard_hdr;                                         /* map + read hdr */
 }
 
 exists (1:r1=1 /\ 1:r2=0)

@@ -23,13 +23,13 @@ C slot-publish
 }
 
 P0 (int *rec_fp, atomic_int *slot) {
-  *rec_fp = 42;                                            (* arena record bytes *)
-  atomic_store_explicit(slot, 1, memory_order_release);    (* publish the offset *)
+  *rec_fp = 42;                                            /* arena record bytes */
+  atomic_store_explicit(slot, 1, memory_order_release);    /* publish the offset */
 }
 
 P1 (int *rec_fp, atomic_int *slot) {
-  int r1 = atomic_load_explicit(slot, memory_order_acquire); (* observe the slot *)
-  int r2 = *rec_fp;                                          (* follow to record *)
+  int r1 = atomic_load_explicit(slot, memory_order_acquire); /* observe the slot */
+  int r2 = *rec_fp;                                          /* follow to record */
 }
 
 exists (1:r1=1 /\ 1:r2=0)

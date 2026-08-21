@@ -1,0 +1,21 @@
+X86 shm-gset-SB-relacq-CONTROL
+(*
+ * CONTROL for SB-sc.X86.litmus: the same store-buffer shape with the seq_cst
+ * downgraded to release/acquire, which on x86 means the MFENCE simply
+ * disappears (release stores and acquire loads are plain MOVs on TSO).
+ *
+ * THIS IS THE ONE CONTROL IN THE WHOLE DIRECTORY THAT IS ALLOWED ON X86. Every
+ * other control needs a weak model to expose the bug; this one does not,
+ * because the store buffer lets both stores sit unflushed while both loads read
+ * the stale values. It is the litmus-level counterpart of the result
+ * ../../core/shm_gset_reset_core.c reproduces on real x86-64 silicon under
+ * -DRELAXED_SEAL, and the reason the "it works on x86" intuition is actively
+ * wrong for this one handshake.
+ *
+ * EXPECTED: "Sometimes" -> ALLOWED on x86tso.cat.
+ *)
+{ }
+ P0            | P1            ;
+ MOV [seal],$1 | MOV [reg],$1  ;
+ MOV EAX,[reg] | MOV EAX,[seal];
+exists (0:EAX=0 /\ 1:EAX=0)

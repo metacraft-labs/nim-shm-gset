@@ -1,0 +1,25 @@
+X86 shm-gset-MP-both-lowerings
+(*
+ * x86-64 leg of the nim-shm-gset publish->follow pairs — and the reason the
+ * ARMv8 and RISC-V legs exist.
+ *
+ * On x86-TSO, `memory_order_release` on a store and `memory_order_acquire` on a
+ * load are FREE: both lower to a plain MOV. So the SHIPPED build and the
+ * RELAXED control compile to the SAME instruction sequence — the one below —
+ * and x86-TSO forbids the bad outcome for both, because TSO reorders neither
+ * store->store nor load->load.
+ *
+ * That is exactly the trap §4.5 warns about: on x86 a missing acquire/release
+ * is INVISIBLE. There is no separate x86 control file because there is no
+ * separate x86 program to write; the control is MP-relaxed.AArch64.litmus and
+ * MP-relaxed.RISCV.litmus, where the same C source becomes a program whose bad
+ * outcome IS reachable.
+ *
+ * EXPECTED: "Never" -> Forbidden on x86tso.cat.
+ *)
+{ }
+ P0             | P1             ;
+ MOV [data0],$42| MOV EAX,[flag] ;
+ MOV [data1],$7 | MOV EBX,[data0];
+ MOV [flag],$1  | MOV ECX,[data1];
+exists (1:EAX=1 /\ (1:EBX=0 \/ 1:ECX=0))

@@ -1,0 +1,21 @@
+RISCV shm-gset-MP-relaxed-CONTROL
+(*
+ * CONTROL for MP-shipped.RISCV.litmus: the same shape with both fences removed,
+ * which is what `memory_order_relaxed` lowers to under RVWMO.
+ *
+ * EXPECTED: "Sometimes" -> ALLOWED on riscv.cat. RVWMO is weaker than x86-TSO
+ * in exactly the direction that matters here: it reorders both the two stores
+ * and the two loads.
+ *)
+{
+0:x5=data0; 0:x6=data1; 0:x7=flag;
+1:x5=flag;  1:x6=data0; 1:x7=data1;
+}
+ P0                | P1                ;
+ ori x1,x0,42      | lw x1,0(x5)       ;
+ sw x1,0(x5)       | lw x2,0(x6)       ;
+ ori x2,x0,7       | lw x3,0(x7)       ;
+ sw x2,0(x6)       |                   ;
+ ori x3,x0,1       |                   ;
+ sw x3,0(x7)       |                   ;
+exists (1:x1=1 /\ (1:x2=0 \/ 1:x3=0))

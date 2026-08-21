@@ -19,11 +19,11 @@ C slot-publish-RELAXED-control
 
 P0 (int *rec_fp, atomic_int *slot) {
   *rec_fp = 42;
-  atomic_store_explicit(slot, 1, memory_order_relaxed);    (* WRONG: relaxed *)
+  atomic_store_explicit(slot, 1, memory_order_relaxed);    /* WRONG: relaxed */
 }
 
 P1 (int *rec_fp, atomic_int *slot) {
-  int r1 = atomic_load_explicit(slot, memory_order_relaxed); (* WRONG: relaxed *)
+  int r1 = atomic_load_explicit(slot, memory_order_relaxed); /* WRONG: relaxed */
   int r2 = *rec_fp;
 }
 

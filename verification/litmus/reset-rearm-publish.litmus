@@ -31,13 +31,13 @@ C reset-rearm-publish
 }
 
 P0 (int *alive, atomic_int *generation) {
-  *alive = 1;                                                (* RE-ARM ... *)
-  atomic_store_explicit(generation, 2, memory_order_release); (* ... then COMMIT *)
+  *alive = 1;                                                /* RE-ARM ... */
+  atomic_store_explicit(generation, 2, memory_order_release); /* ... then COMMIT */
 }
 
 P1 (int *alive, atomic_int *generation) {
-  int r1 = atomic_load_explicit(generation, memory_order_acquire); (* gen FIRST *)
-  int r2 = *alive;                                                 (* then token *)
+  int r1 = atomic_load_explicit(generation, memory_order_acquire); /* gen FIRST */
+  int r2 = *alive;                                                 /* then token */
 }
 
 exists (1:r1=2 /\ 1:r2=0)

@@ -358,24 +358,37 @@ disagreement between two BUILDS), `verification/tla/shm_gset_reset.tla`,
 `verification/core/shm_gset_reset_core.c` (+ its `-DRELAXED_SEAL` control) and
 `verification/litmus/reset-*.litmus`.
 
-Two of them are NOT satisfied, and saying so is the point of listing them:
+Both of the previously-open items have moved, one fully and one partly:
 
-- **GenMC / CDSChecker and herd7 are absent from this nixpkgs pin**, so the
-  stateless-model-checking and litmus artifacts are AUTHORED, NOT RUN. The exact
-  failing `nix eval` attempts are recorded in `verification/README.md`.
-- **The ARM64 arm is not met.** `just verify-aarch64` cross-builds and runs every
-  C11 core under `qemu-user`, which does **not** reproduce ARMv8 weak memory — it
-  is a functional check (ABI, lowering, logic), and the `-DRELAXED_SEAL` control
-  reports ZERO there while reporting real failures on x86-64 hardware, which is
-  exactly how you can tell qemu is not modelling the store buffer. Real ARM64
-  weak-memory coverage needs real hardware or herd7.
+- **GenMC / CDSChecker / Nidhugg / herd7 are still absent from nixpkgs — so this
+  repo packages them.** `flake.nix` + `nix/*.nix` build all four against a
+  pinned nixpkgs, and the committed `flake.lock` is what makes the results
+  reproducible instead of dependent on the machine's flake registry. The litmus
+  and stateless-model-checking artifacts are now **RUN**, and one of them
+  (GenMC on the RELAXED_SEAL reset core) produces the `m6` counterexample the
+  TLA+ model could not even express. Full results in `verification/README.md`.
+- **The ARM64 arm is PARTLY met.** The memory-ordering half is done formally:
+  `verification/litmus/arch/*.AArch64.litmus` proves every shipped publish pair
+  and the seal handshake Forbidden under `aarch64.cat`, and proves their
+  downgrades ALLOWED there while x86-TSO forbids them — the "passes on x86,
+  faults on Apple silicon" asymmetry, demonstrated rather than asserted. What
+  remains open needs real silicon: the §4.5(f) multi-hour ARM64 soak, an aarch64
+  Nim toolchain for the library itself (only the C cores cross-build today), and
+  a real ARM64 kernel. `just verify-aarch64` remains a **functional** qemu-user
+  check, and its `-DRELAXED_SEAL` control reporting ZERO is still exactly how
+  you can tell qemu is not modelling the store buffer.
 
 ## Test & benchmark
 
 ```bash
 just test     # functional + multi-process concurrency (or: nimble test, once committed)
+just verify   # the whole §4.5 formal / weak-memory tier, all tools from flake.nix
 just bench    # M1 transport head-to-head vs nim-shm-queue (needs ../nim-shm-queue)
 ```
+
+`just verify` fans out to `verify-tla`, `verify-core`, `verify-litmus`,
+`verify-models`, `verify-cdschecker` and `verify-aarch64`; every tool comes from
+this repo's pinned flake rather than `nix shell nixpkgs#…`.
 
 ## Status
 

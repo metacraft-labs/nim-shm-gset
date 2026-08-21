@@ -1,0 +1,37 @@
+AArch64 shm-gset-MP-shipped
+(*
+ * ARMv8 leg of the nim-shm-gset publish->follow pairs (design spec §4.5(a)).
+ *
+ * WHY THIS FILE EXISTS. The tests in ../*.litmus are `C` litmus tests, so herd7
+ * checks them against the C11 LANGUAGE model (c11_partialSC.cat and friends) —
+ * it cannot run them against aarch64.cat, because a cat model is tied to one
+ * architecture and herd7 rejects the mismatch. The C11 result is the right
+ * answer to "does the LANGUAGE guarantee it"; this file is the answer to "does
+ * ARMv8 HARDWARE guarantee it, once the compiler has lowered it".
+ *
+ * All SEVEN shipped message-passing pairs in this library — slot publish,
+ * arena-offset follow, header magic, shard link, chain bump, reset re-arm,
+ * reset runId stamp — are the SAME shape at the hardware level: plain data
+ * store(s), then a release store of a flag; reader acquire-loads the flag, then
+ * plainly loads the data. Two payload words are used here so the shape also
+ * covers arena-offset-follow, whose reader follows the published offset to two
+ * separate record fields (fp at +0, len at +8).
+ *
+ * LOWERING. The shipped C11 orders lower on ARMv8 to:
+ *   memory_order_release store -> STLR
+ *   memory_order_acquire load  -> LDAR
+ *
+ * EXPECTED: "Never" -> Forbidden on aarch64.cat.
+ *)
+{
+0:X1=data0; 0:X2=data1; 0:X3=flag;
+1:X1=flag;  1:X2=data0; 1:X3=data1;
+}
+ P0            | P1            ;
+ MOV W0,#42    | LDAR W0,[X1]  ;
+ STR W0,[X1]   | LDR W4,[X2]   ;
+ MOV W4,#7     | LDR W5,[X3]   ;
+ STR W4,[X2]   |               ;
+ MOV W5,#1     |               ;
+ STLR W5,[X3]  |               ;
+exists (1:X0=1 /\ (1:X4=0 \/ 1:X5=0))

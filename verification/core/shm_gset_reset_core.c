@@ -29,10 +29,18 @@
  *     (the seal handshake), so no producer ever stamps a generation whose
  *     action it does not belong to.
  *
- * HOW TO MODEL-CHECK (tools NOT in this repo's pin — author-not-run here; see
- * verification/README.md for the exact failing `nix` attempts):
- *   GenMC:      genmc -unroll=3 -- shm_gset_reset_core.c
- *   Nidhugg:    nidhugg --c11 --unroll=3 shm_gset_reset_core.c
+ * HOW TO MODEL-CHECK. nixpkgs carries neither tool, so this repo packages and
+ * pins them (see ../../nix/ and ../../flake.nix). Blessed runner: `just
+ * verify-models`. RAN and green: 30 504 complete + 5 808 blocked executions
+ * under GenMC/RC11; the -DRELAXED_SEAL control reports `Error: Safety
+ * violation!` with a counterexample, which is the `m6` coverage the TLA+ model
+ * cannot express (there, PAttach is atomic). Equivalent commands:
+ *   GenMC:      genmc -disable-ipr -unroll=5 -- -std=c11 shm_gset_reset_core.c
+ *   GenMC ctl:  ... -DRELAXED_SEAL   (MUST report a safety violation)
+ * `-disable-ipr` is needed because the hand-rolled spin barrier has two threads
+ * storing the same value to bar_go, which GenMC's in-place revisiting treats as
+ * an error. Nidhugg cannot run this core under --arm (its ARM trace builder
+ * rejects atomicrmw); see ../README.md.
  *
  * It also builds+runs natively as a FUNCTIONAL smoke over many random schedules
  * — that is NOT a weak-memory proof (a native run cannot exhaustively reorder);
@@ -97,9 +105,15 @@ static _Atomic uint32_t reg[NPROD];   /* producer registry: 0 == free */
 static _Atomic uint32_t leaks;      /* cross-generation leak counter */
 
 /* In the SHIPPED build the cross-generation oracle is a hard assert. In the
- * RELAXED_SEAL control it COUNTS instead, so the control can report how often
- * the weaker ordering leaks rather than aborting on the first one. */
-#ifdef RELAXED_SEAL
+ * RELAXED_SEAL control it COUNTS instead, so the NATIVE hammer can report how
+ * often the weaker ordering leaks rather than aborting on the first one.
+ *
+ * The count-instead-of-assert applies to the STANDALONE (native, many-runs)
+ * build ONLY. Under a stateless model checker there is no "how often" — there
+ * is one symbolic run and the question is whether the leak is REACHABLE — so
+ * the control must assert there, otherwise GenMC/Nidhugg would report "no
+ * errors" on the control and the control would prove nothing. */
+#if defined(RELAXED_SEAL) && defined(STANDALONE)
 #define GEN_ORACLE(cond) \
     do { if (!(cond)) atomic_fetch_add_explicit(&leaks, 1, \
                                                 memory_order_seq_cst); } while (0)
@@ -335,5 +349,15 @@ int main(void)
 #endif
 }
 #else
-int main(void) { run_once(); return 0; }   /* model-checker entry */
+/* Model-checker entry: ONE symbolic run, with the two properties the native
+ * hammer can only COUNT raised to hard assertions — a stateless checker answers
+ * "is this reachable", not "how often", so a counter it never reads would make
+ * the RELAXED_SEAL control silently vacuous. */
+int main(void)
+{
+    run_once();
+    /* QUIESCENCE: no producer ever holds an attach across a generation change. */
+    assert(atomic_load_explicit(&straddles, memory_order_seq_cst) == 0);
+    return 0;
+}
 #endif

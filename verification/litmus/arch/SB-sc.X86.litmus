@@ -1,0 +1,16 @@
+X86 shm-gset-SB-sc-shipped
+(*
+ * x86-64 leg of the seal / producer-registry (Dekker) handshake.
+ *
+ * LOWERING. `memory_order_seq_cst` is NOT free on x86: the store side gets an
+ * MFENCE (or is emitted as a locked XCHG) precisely so a later load of a
+ * different location cannot be satisfied out of the store buffer.
+ *
+ * EXPECTED: "Never" -> Forbidden on x86tso.cat.
+ *)
+{ }
+ P0            | P1            ;
+ MOV [seal],$1 | MOV [reg],$1  ;
+ MFENCE        | MFENCE        ;
+ MOV EAX,[reg] | MOV EAX,[seal];
+exists (0:EAX=0 /\ 1:EAX=0)

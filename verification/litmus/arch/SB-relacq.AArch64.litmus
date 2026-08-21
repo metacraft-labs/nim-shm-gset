@@ -1,0 +1,38 @@
+AArch64 shm-gset-SB-relacq-CONTROL
+(*
+ * CONTROL for SB-sc.AArch64.litmus: the same store-buffer shape with the pair
+ * downgraded from seq_cst to release/acquire — the ordering the rest of the
+ * library uses everywhere else.
+ *
+ * A SUBTLETY THAT MUST BE STATED, because it is the one place where the ARMv8
+ * answer is not simply "weaker than x86". ARMv8 has TWO acquire loads:
+ *
+ *   LDAR  — RCsc acquire. This is what a mainstream C compiler emits for BOTH
+ *           memory_order_acquire and memory_order_seq_cst on ARMv8. Paired with
+ *           STLR it is strong enough to forbid SB, so with THIS lowering the
+ *           release/acquire control comes out FORBIDDEN — i.e. on ARMv8 the
+ *           "weaker" C11 program happens to get seq_cst behaviour for free.
+ *   LDAPR — RCpc acquire (ARMv8.3). This is the acquire that C11's
+ *           release/acquire actually *entitles* an implementation to use, and
+ *           it is the lowering modelled below.
+ *
+ * The distinction matters for how the evidence is read: C11 PERMITS the bad
+ * outcome for a release/acquire seal (../reset-seal-vs-register-RELAXED-control
+ * .litmus shows the C11 model saying "Sometimes"), and x86-TSO PERMITS it in
+ * practice (demonstrated on real silicon by ../../core/shm_gset_reset_core.c
+ * built with -DRELAXED_SEAL). That the RCsc lowering on one architecture would
+ * accidentally rescue it is NOT a licence to weaken the ordering — the code
+ * must be correct for every conforming lowering, which is why the shipped four
+ * accesses are seq_cst.
+ *
+ * EXPECTED: "Sometimes" -> ALLOWED on aarch64.cat with the LDAPR lowering.
+ *)
+{
+0:X1=seal; 0:X3=reg;
+1:X1=reg;  1:X3=seal;
+}
+ P0            | P1            ;
+ MOV W0,#1     | MOV W0,#1     ;
+ STLR W0,[X1]  | STLR W0,[X1]  ;
+ LDAPR W2,[X3] | LDAPR W2,[X3] ;
+exists (0:X2=0 /\ 1:X2=0)

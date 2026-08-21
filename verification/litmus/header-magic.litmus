@@ -21,13 +21,13 @@ C header-magic
 }
 
 P0 (int *capacity, atomic_int *magic) {
-  *capacity = 128;                                          (* geometry field *)
-  atomic_store_explicit(magic, 1, memory_order_release);    (* publish magic LAST *)
+  *capacity = 128;                                          /* geometry field */
+  atomic_store_explicit(magic, 1, memory_order_release);    /* publish magic LAST */
 }
 
 P1 (int *capacity, atomic_int *magic) {
-  int r1 = atomic_load_explicit(magic, memory_order_acquire); (* headerValid *)
-  int r2 = *capacity;                                         (* read geometry *)
+  int r1 = atomic_load_explicit(magic, memory_order_acquire); /* headerValid */
+  int r2 = *capacity;                                         /* read geometry */
 }
 
 exists (1:r1=1 /\ 1:r2=0)

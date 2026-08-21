@@ -32,13 +32,13 @@ C reset-runid-stamp
 }
 
 P0 (int *slot1len, atomic_int *generation) {
-  *slot1len = 7;                                              (* stamp slot (N+1)&1 *)
-  atomic_store_explicit(generation, 2, memory_order_release); (* COMMIT *)
+  *slot1len = 7;                                              /* stamp slot (N+1)&1 */
+  atomic_store_explicit(generation, 2, memory_order_release); /* COMMIT */
 }
 
 P1 (int *slot1len, atomic_int *generation) {
   int r1 = atomic_load_explicit(generation, memory_order_acquire);
-  int r2 = *slot1len;                                         (* pick + read slot *)
+  int r2 = *slot1len;                                         /* pick + read slot */
 }
 
 exists (1:r1=2 /\ 1:r2=0)

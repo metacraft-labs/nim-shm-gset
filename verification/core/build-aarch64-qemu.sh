@@ -3,14 +3,19 @@
 # (design spec §4.5 ARM64 arm). IMPORTANT HONESTY CAVEAT: qemu-user does NOT
 # faithfully reproduce ARMv8 weak-memory relaxations — it is a FUNCTIONAL check
 # (aarch64 ABI / layout / compile correctness), NOT a weak-memory proof. Real
-# weak-memory coverage needs real ARM hardware, or the herd7 litmus tests
-# (../litmus) and a GenMC run of this same core.
+# weak-memory coverage needs real ARM hardware, or the ARMv8 litmus tests
+# (../litmus/arch/*.AArch64.litmus, RUN and green) and the GenMC/RC11 run of this
+# same core (`just verify-models`). Both are wired now; see ../README.md, "The
+# ARM64 requirement", for what they do and do not settle.
 #
 # There is no aarch64 Nim toolchain in the dev shell, so only the C11 core (not
 # the Nim tests) is cross-built here. Run:
-#   nix shell nixpkgs#pkgsCross.aarch64-multiplatform.buildPackages.gcc \
-#             nixpkgs#pkgsCross.aarch64-multiplatform.glibc \
-#     --command verification/core/build-aarch64-qemu.sh
+#   just verify-aarch64
+# which supplies the cross toolchain and qemu from this repo's PINNED flake:
+#   nix shell .#aarch64-cross-env --command verification/core/build-aarch64-qemu.sh
+# (`nix shell`, not `nix develop`: a devShell exports NIX_CFLAGS_COMPILE with
+#  -isystem pointing at the NATIVE glibc, which the cross gcc wrapper honours and
+#  then dies on `gnu/stubs-32.h: No such file or directory`.)
 set -uo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cc=aarch64-unknown-linux-gnu-gcc

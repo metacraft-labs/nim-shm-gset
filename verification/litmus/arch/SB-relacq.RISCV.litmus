@@ -1,0 +1,24 @@
+RISCV shm-gset-SB-relacq-CONTROL
+(*
+ * CONTROL for SB-sc.RISCV.litmus: the same store-buffer shape lowered as
+ * release/acquire rather than seq_cst — `fence rw,w` before the store, and
+ * `fence r,rw` after the load. Neither fence orders a store BEFORE a later load
+ * of a different address, which is the ordering the handshake needs.
+ *
+ * EXPECTED: "Sometimes" -> ALLOWED on riscv.cat. This is the same verdict the
+ * C11 model gives for ../reset-seal-vs-register-RELAXED-control.litmus and the
+ * same one x86-64 silicon gives for ../../core/shm_gset_reset_core.c built with
+ * -DRELAXED_SEAL, which is why these four accesses are the library's only
+ * sequentially-consistent ones.
+ *)
+{
+0:x5=seal; 0:x6=reg;
+1:x5=reg;  1:x6=seal;
+}
+ P0                | P1                ;
+ ori x1,x0,1       | ori x1,x0,1       ;
+ fence rw,w        | fence rw,w        ;
+ sw x1,0(x5)       | sw x1,0(x5)       ;
+ lw x2,0(x6)       | lw x2,0(x6)       ;
+ fence r,rw        | fence r,rw        ;
+exists (0:x2=0 /\ 1:x2=0)

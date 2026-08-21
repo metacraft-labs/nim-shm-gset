@@ -1,0 +1,22 @@
+RISCV shm-gset-SB-sc-shipped
+(*
+ * RISC-V leg of the seal / producer-registry (Dekker) handshake. See
+ * SB-sc.AArch64.litmus for the protocol description.
+ *
+ * LOWERING. Under RVWMO a `memory_order_seq_cst` store followed by a seq_cst
+ * load of a different location needs a full `fence rw,rw` between them — the
+ * store-load direction is the one no weaker fence covers, and it is the exact
+ * direction this handshake depends on.
+ *
+ * EXPECTED: "Never" -> Forbidden on riscv.cat.
+ *)
+{
+0:x5=seal; 0:x6=reg;
+1:x5=reg;  1:x6=seal;
+}
+ P0                | P1                ;
+ ori x1,x0,1       | ori x1,x0,1       ;
+ sw x1,0(x5)       | sw x1,0(x5)       ;
+ fence rw,rw       | fence rw,rw       ;
+ lw x2,0(x6)       | lw x2,0(x6)       ;
+exists (0:x2=0 /\ 1:x2=0)

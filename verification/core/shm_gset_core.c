@@ -23,11 +23,16 @@
  *   - no-phantom: every occupied slot holds a real inserted element.
  *   - grow arb:   at most the expected number of shards; chain stays valid.
  *
- * HOW TO MODEL-CHECK (tools NOT in this repo's pin — author-not-run here; see
- * verification/README.md for the exact failing `nix` attempts):
- *   GenMC:      nix shell nixpkgs#genmc  --command genmc -- -unroll=3 shm_gset_core.c
- *   Nidhugg:    nidhugg --c11 --unroll=3 shm_gset_core.c
- *   CDSChecker: compile with -DCDSCHECKER against its model API (see README).
+ * HOW TO MODEL-CHECK. nixpkgs carries none of these tools, so this repo packages
+ * them (see ../../nix/) and pins them (../../flake.nix). The blessed runner is
+ *   just verify-models
+ * which is equivalent to:
+ *   GenMC:      genmc -unroll=5 -- -std=c11 shm_gset_core.c
+ *   Nidhugg:    nidhuggc --c -- --sc|--tso|--pso --unroll=5 shm_gset_core.c
+ *               (NOT --c11, which does not exist, and NOT --arm: Nidhugg's ARM
+ *                trace builder rejects atomicrmw, which this core uses)
+ *   CDSChecker: cannot consume this file — it replaces the atomics and thread
+ *               APIs and needs `user_main`; see ../cdschecker/ for the ports.
  *
  * It also builds+runs natively as a FUNCTIONAL smoke (many random schedules) —
  * that is NOT a weak-memory proof (a native run cannot exhaustively reorder);
