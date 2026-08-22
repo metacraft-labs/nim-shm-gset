@@ -545,8 +545,24 @@ alone, including the §4.5 SIGKILL fault-injection battery), unnoticed because
 `nimble` was not installed anywhere and `nimble test` simply exited 127.
 `nimble` is in `flake.nix` now, and `just check-runner-parity` —
 `scripts/check-runner-parity.sh`, the first step of BOTH runners — fails if the
-two disagree on which `tests/*.nim` they compile, on the flags any of them is
-compiled with, or if a `tests/test_*.nim` on disk is registered with neither.
+two disagree on which `tests/**/*.nim` they compile, on the flags any of them is
+compiled with, on whether a file is RUN (`-r`) as opposed to merely built, or if
+a `.nim` file under `tests/` is registered with neither.
+
+Those last two are the ways the first version of the gate could be defeated
+while still reporting OK. `-r` is checked separately from the flags, because a
+file one runner runs and the other only builds keeps both the file set and the
+flag set identical while silently stopping the execution of every case in it —
+and a `-r` dropped from *both* sides is the same defeat, so a registered file
+that neither runner runs is an error too. Discovery is `tests/**/*.nim` at any
+depth and under any name, rather than `tests/test_*.nim` at depth 1: a
+`tests/keyed/` subdirectory or a file called `soak_probe.nim` is an ordinary
+thing to add, and under the old scope either would have been registered with
+neither runner and reported as OK. A `.nim` file under `tests/` is accounted for
+by being registered with both runners, by being imported (transitively) by a
+registered compile — `tests/ac_index_model.nim` is the reference-model module
+three tests share — or by being a `tests/helpers/` fixture program that
+something in the repo drives.
 
 `just verify` fans out to `verify-tla`, `verify-core`, `verify-litmus`,
 `verify-models`, `verify-cdschecker` and `verify-aarch64`; every tool comes from
