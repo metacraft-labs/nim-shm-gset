@@ -114,7 +114,8 @@ echo s.shardCount(), s.growthFailures()  # metrics; growthFailures>0 ⇒ mcIncom
 
 ## Reset and recycling
 
-**Status: IMPLEMENTED (`reset`).** Motivated by hosting the monitor
+**Status: IMPLEMENTED (`reset` + the host-side pool, `shm_gset/pool`).**
+Motivated by hosting the monitor
 in-process (`reprobuild-specs/In-Process-Monitor-Hosting.md`): a long-lived
 daemon that owns the set can hand an already-grown chain to the next action
 instead of creating and growing a fresh one, so grow-only becomes an
@@ -262,6 +263,157 @@ becomes visible:
   window between rewriting it and bumping the generation is a chain whose
   finished action's contents carry the next action's identity.
 - **Wraparound** is refused rather than risked — see above.
+
+### The host-side pool — **landed** (`shm_gset/pool`)
+
+`reset` makes recycling possible; `SetPool` makes it happen. A long-lived host
+asks the pool for a chain per action and gives it back when the action ends:
+
+```nim
+import shm_gset/pool
+
+var pool = newSetPool(dir, appId = "io-mon")     # once, per host process
+var lease = pool.acquire(runId)                  # per action
+setEnv("REPRO_MONITOR_DEP_SHM", lease.path0)
+...
+for element in lease.items: ...                  # the action's evidence
+lease.release()                                  # the action ENDS here
+doAssert pool.close() == 0                       # at shutdown; 0 == nothing left
+destroySetPool(pool)                             # ...and free the pool itself
+```
+
+**Release every lease, and check what `close` returns.** `close`'s result is the
+number of leases that never came back, and it is the caller's only signal: on a
+nonzero result *the shard files of those chains are still on disk when `close`
+returns*. It deliberately does not unlink them, because from the pool's side a
+lease an action is still writing to and a lease that was dropped and never will
+come back are the same state, and unlinking the live one is the "reap a live
+segment" fault the owner-pid rule exists to prevent. Those files are swept by
+`destroySetPool`, which is the host's statement that no thread will touch the
+pool again — so a host that never calls it, and drops leases, keeps them for the
+life of the process. `destroySetPool` also frees the pool object itself; it is a
+separate step from `close` so that a closed pool stays safely callable (`acquire`
+returns `prClosed`) while another thread is still shutting down.
+
+Measured: twelve actions of the same size through one pool link **4** shard
+files; the same twelve without it link **48** (`pool_stops_growing_after_warmup`
+asserts both, in the same run, so the saving is a measurement and not a claim).
+
+**The pool owns reset, structurally.** A `SetLease` has no public constructor,
+exposes only the action's READ surface (no `reset`, no `finish`, no
+`markConsumerGone`), and cannot be copied (`=copy` is an error, so a lease
+released twice is a compile error rather than two actions sharing one chain).
+`acquire` cuts a lease from an idle chain only when `reset` returned `rsReset`,
+double-checked against the chain's own published generation having advanced past
+the value the pool was holding. That second check is *defence-in-depth, not the
+guarantee*: `reset` publishes the generation bump as its commit store before it
+can return `rsReset`, so `rsReset` already implies it, and deleting the check
+reddens no test. What it buys is that the hand-out condition is stated over the
+segment's published state rather than over a return value alone. The only other
+path to a lease creates a chain, which is empty by construction. And while a
+chain is leased the pool holds no handle to it at all — `acquire` MOVES the
+`SetHost` out of the idle list — so two leases over one chain is not a race to
+be won but a state that cannot be represented.
+
+Reset happens on ACQUIRE, not on release, because reset stamps the run identity
+and the next action's identity is not known until then. Release marks the
+consumer gone (so a late producer of the finished action fast-fails with
+`emConsumerGone` instead of writing into the chain the next action is about to
+be given); acquire's reset re-arms it. That is asserted against a real producer
+still attached across the boundary, in
+`release_marks_the_consumer_gone_for_a_late_producer`: its next `emit` after the
+release returns `emConsumerGone`, and the condemned chain cannot link a new
+shard file either — which is what makes retirement's unlink safe under an
+attached producer.
+
+**`SetPool` is a `ptr`, not a `ref`, and that is load-bearing.** ORC's reference
+counts are atomic only under `-d:gcAtomicArc`, so handing a `ref` to N host
+threads races the counter and frees a live object — which surfaces as a SIGSEGV
+inside the Nim runtime, far from the code responsible. The first version of this
+pool was a `ref object`; it passed every functional assertion and then crashed
+intermittently — a minority of whole-file runs, at a sampled rate that wandered
+between roughly one run in six and one in eight across the samples taken. That
+spread is not a specification; it is the reason the fix was settled with TSAN
+rather than by counting clean runs, since no feasible number of clean runs
+settles an event at that frequency. TSAN over the concurrency case reports
+**data races on the pool's own reference count** — `nimIncRef` / `nimDecRef`
+reached from `acquire` / `release` in two different worker threads — with the
+`ref`, and **none** with the `ptr`. Nonzero versus zero is the result; the
+*count* is schedule-dependent and varies run to run, so it is not written down
+as something the build should reproduce. Every GC'd field behind the pointer is
+touched only under the pool's lock (`dir` and `appId` are copied into locals
+there before use), and the TSAN run is wired into `just test-sanitizers`.
+
+**Who owns a pooled chain.** A pooled chain is owned, for its whole life, by the
+process that CREATED it, which is always the pool's own process: the pool
+creates every chain it manages and never adopts a foreign `SetHost`, and it is
+not fork-inheritable — `acquire`, `release`, `close` and `destroySetPool`, which
+is **every entry point that mutates anything**, all refuse from any other
+process. There are four, not three: `destroySetPool` was for one round the only
+unguarded one, and since it is the only call that unlinks *unconditionally* that
+made it the most destructive entry point in the module. They refuse in four
+different ways, because they have four different channels to report on:
+
+| call | from a foreign process |
+|---|---|
+| `acquire` | hands back a dead lease: `available` is false, `refusal` is `prForeignProcess`. The only one that names the reason. |
+| `release` | **silent no-op** — it returns `void` and a `SetLease` has no error channel, so the child cannot learn it did nothing. The lease is marked spent and the chain is left alone. |
+| `close` | returns **-1**, distinct from the 0-or-more outstanding-lease count it returns in the owning process, and unlinks nothing. |
+| `destroySetPool` | does **nothing at all** — no close, no sweep, no unlink, no `deinitLock`, no free — and leaves `p` **non-nil**. That is the channel: a destroy in the owning process nils `p`, so `p != nil` after the call is exactly "this process was refused". |
+
+A fork child may not free even its own copy-on-write copy of the pool struct,
+and that was decided rather than allowed. The memory is process-local, so
+freeing it would harm nobody — but it buys nothing (a fork child's honest fates
+are `_exit` and `exec`, both of which drop the address space anyway) and costs
+three things: `deinitLock` is `pthread_mutex_destroy`, which is undefined on the
+LOCKED mutex a fork from a multi-threaded host can hand the child; nilling `p`
+downgrades the child's next `acquire` from `prForeignProcess` to the misleading
+`prClosed`; and a dangling pointer copy is a worse outcome than a live one. All
+four guards sit **before** the first `withLock` for the same fork-from-a-
+multi-threaded-host reason: a child that reached a `withLock` at all could
+deadlock on a mutex copied in the locked state. That is a statement about those
+four and not about the whole module: `stats`, `idleChains` and `leasedChains`
+are read-only and deliberately unguarded, and they *do* take the lock — so a
+fork child that merely inspects a pool it is forbidden to use can still block on
+it. Read-only, so outside the ownership rule; inside the deadlock hazard, so
+named here rather than left to be discovered.
+
+Refusing is a correctness rule, not
+hygiene: the mapping is `MAP_SHARED`, so a child that "released" an inherited
+lease would mark the consumer gone on a chain the PARENT is still serving an
+action with, and every producer of that action would start fast-failing,
+silently. An unguarded `destroySetPool` is worse still, and was measured to be:
+with the parent mid-action, a child's destroy unlinked the parent's anchor, and
+the parent's next producer could not `attachProducer` at all — where the stray
+`markConsumerGone` at least fails *visibly* with `emConsumerGone`, an unlinked
+anchor leaves the action unmonitored with nothing to say so. Note what the rule
+is NOT about: `reset` re-points `ShOffConsumerPid`
+at the calling process, but that field is **write-only in this library** — the
+reaper takes its owner pid from the shard file's NAME, which `reset` never
+touches. So the identity that decides a chain's fate is the create-time one, and
+keeping the pool's process the only one that ever touches a pooled chain is what
+keeps the two from diverging.
+
+**What the pool does with a refusal**, since `reset`'s six statuses are not
+interchangeable: `rsBusyProducers` is transient and is RETRIED (the refusal
+count rides on the idle entry across acquires, so retries are spread over real
+time), but only up to a budget — a detached descendant that never exits, the
+§4.1 shape, would otherwise wedge the pool on one chain forever.
+`rsProducersUntracked` and `rsGenerationExhausted` RETIRE the chain, because
+neither can be relied on to clear and a chain that quietly stops recycling for
+the life of the host is worse than one chain's lost capacity. `rsInvalidRunId`
+refuses the ACQUIRE and touches no chain: it is a caller fault, and the naive
+"anything but `rsReset` ⇒ retire" would destroy a good chain for a bad argument.
+Retiring UNLINKS the shard files rather than leaving them to the reaper, which
+collects only when the owner pid is dead — and the owner is the pool's process,
+alive by construction.
+
+The lifecycle has its own §4.5 artifact: `verification/tla/shm_gset_pool.tla`
+checks that no two in-flight actions share a chain, that no chain is handed out
+whose generation did not advance, that a leased chain is never recycled under
+its holder, that retirement is final, that no chain is lost track of, and that a
+permanently unrecyclable chain is retired rather than kept. Each mechanism can
+be switched off from the same module and the resulting violation observed.
 
 ### `runId` is out of the filename — **landed**
 

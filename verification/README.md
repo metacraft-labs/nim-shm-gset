@@ -37,17 +37,34 @@ cost `just verify-core` its §4.5(g) leg. (Re-checked against the pin's own
 gcc 14.3.0: compiles fine, then exits 66 on that FATAL before a single
 iteration.)
 
-The boundary is exactly `verify-*`. `just test`, `just soak`, `just bench` and
-the `test-sanitizers` / `test-valgrind` / `test-rr` targets deliberately keep
-using the AMBIENT workspace toolchain — that is what a developer edits against
-all day, and io-mon consumes this repo as a plain source path compiled by
-io-mon's own Nim. The rows below that say "(dev shell)" mean that ambient
-toolchain, not the flake. `nix develop . -c just test` also works and gives the
-same 85 `[OK]` / 0 `[FAILED]`; it is simply not forced.
+The boundary is *almost* exactly `verify-*`. `just test`, `just soak`,
+`just bench` and the `test-sanitizers` / `test-rr` targets deliberately keep
+using the AMBIENT workspace toolchain, end to end — that is what a developer
+edits against all day, and io-mon consumes this repo as a plain source path
+compiled by io-mon's own Nim. The rows below that say "(dev shell)" mean that
+ambient toolchain, not the flake. `nix develop . -c just test` also works and
+gives the same **101 `[OK]` / 0 `[FAILED]` / 0 `[SKIPPED]`** (re-measured
+2026-08-22); it is simply not forced. That count sat stale at 97 for two rounds
+while the suite grew to 100 and then 101 — if you change the suite, re-measure
+it here and in the `Justfile` header rather than carrying the old one forward.
+
+**`test-valgrind` is the exception, and this paragraph used to get it wrong.**
+It was described here and in the `Justfile` as an ambient target, but `valgrind`
+is not in the workspace shell — it is in *this repo's* `flake.nix`, moved there
+when the §4.5(g) dynamic tier was pinned, and neither doc followed it. Measured
+on a bare workspace shell: `just test-valgrind` exited **127** with
+`sh: line 1: valgrind: command not found`, so the target had been documented as
+runnable where it was not. Fixed in the recipe rather than only in the prose:
+`test-valgrind` still BUILDS its binaries with the ambient nim (the build a
+developer actually produces) and now invokes the valgrind BINARY through the
+pinned flake, so `just test-valgrind` works from a bare workspace shell —
+re-measured after the change, exit 0, helgrind and DRD 0 errors, memcheck
+`All heap blocks were freed`. Rows below that name valgrind therefore say
+"(pinned flake)".
 
 ```
 just verify            # the whole tier
-just verify-tla        # TLC, 4 models
+just verify-tla        # TLC, 5 models
 just verify-core       # native C11 cores + the RELAXED_SEAL control + TSAN
 just verify-litmus     # herd7: 44 C11-model checks + 11 hardware-model checks
 just verify-models     # GenMC + Nidhugg over the real C11 cores
@@ -62,14 +79,17 @@ just verify-aarch64    # cross-build + qemu-user (FUNCTIONAL only)
 | Protocol model, IDENTITY key discipline | TLA+ / TLC (pinned flake) | `just verify-tla` | **RAN — green.** 750 distinct states, depth 30, all invariants (incl. `ProbeRunComplete`) + 2 temporal props hold |
 | Protocol model, KEYED discipline (multimap + tombstones + growth) | TLA+ / TLC | `just verify-tla` | **RAN — green.** 38,151 distinct states, depth 53 |
 | Protocol model, flatten + retire vs a concurrent reader | TLA+ / TLC | `just verify-tla` | **RAN — green.** 51,375 distinct states, depth 71 |
-| Valgrind DRD + helgrind | `valgrind` (dev shell) | `just test-valgrind` | **RAN — 0 errors** (both tools) |
+| **Recycling POOL under N in-flight actions (HM-3)** | TSAN (dev shell) | `just test-sanitizers` | **RAN — 0 races.** Not about the segment's atomics: about the pool's own Nim-level state. It EARNED its place — the pool was first a `ref object`, on which TSAN reports **races on the pool's own refcount** (`nimIncRef`/`nimDecRef` from `acquire`/`release` in two worker threads; ORC counters are atomic only under `-d:gcAtomicArc`), and which crashed in the runtime intermittently — a minority of whole-file runs, sampled between roughly one in six and one in eight — while passing every functional assertion. **The gate is NONZERO vs ZERO, not a count:** TSAN reports per observed schedule, so the number of races on a `ref` build is not a specification, exactly as the `-DRELAXED_SEAL` control's straddle counts are not. The shipped `ptr` + lock-guarded GC'd fields is clean |
+| Valgrind DRD + helgrind | `valgrind` (pinned flake; binaries built ambient) | `just test-valgrind` | **RAN — 0 errors** (both tools) |
+| **Pool lifecycle leak gate (HM-3)** | `valgrind` memcheck (pinned flake; binary built ambient) | `just test-valgrind` | **RAN — 0 errors, all heap blocks freed.** `tests/helpers/pool_lifecycle_probe.nim` under `--leak-check=full --errors-for-leak-kinds=definite`. NOT a race check: `SetPoolObj` is `allocShared0` memory with no destructor, so a GC'd field merely TRUNCATED before `deallocShared` is orphaned — 136 bytes definitely lost PER POOL. Quote the per-pool figure, not a whole-program one: `pool_lifecycle_probe.nim` drives TWO pool lifecycles, so reverting the fix measures **272 bytes definitely lost in 2 blocks, `ERROR SUMMARY: 2 errors from 2 contexts`**, exit 99 — the "1 error from 1 context" recorded during the original diagnosis came from a one-pool scratch program that is not what this gate runs |
 | rr chaos record + replay | `rr` (dev shell) | `just test-rr` | **RAN — green.** Oracle held across 5 chaos schedules + 1 deterministic replay |
 | Longer bounded soak | Nim (dev shell) | `just soak <secs>` | **RAN — green** (60 s: distinct=7200, growthFailures=0) |
 | C11 atomics core, native | `gcc` (dev shell) | `core/` `-DSTANDALONE` | **RAN — green** (200000 slot-claim races) + TSAN clean |
 | C11 atomics core, aarch64 | cross-gcc + `qemu-aarch64` | `core/build-aarch64-qemu.sh` | **RAN — green, FUNCTIONAL ONLY** (see caveat) |
 | **Reset/recycling protocol (HM-2)** | TLA+ / TLC | `just verify-tla` | **RAN — green.** 901 distinct states, depth 18, 5 safety invariants + 1 temporal property. `just verify-tla` is 4/4 green end to end (750 / 38 151 / 51 375 / 901 distinct states), exit 0 |
+| **Host-side recycling POOL lifecycle (HM-3)** | TLA+ / TLC | `just verify-tla` | **RAN — green.** 7,444 distinct states, depth 15, 8 safety invariants + 1 temporal property. `just verify-tla` is 5/5 green end to end. See "The pool model has teeth" below for the three switched-off mutations and the seven vacuity probes |
 | **Reset/recycling C11 core, native** | `gcc` | `just verify-core` | **RAN — green** (100 000 barrier-synchronised reset-vs-insert races) + TSAN clean |
-| **Reset core, `-DRELAXED_SEAL` control** | `gcc` | `just verify-core` | **RAN — FAILS AS INTENDED** on x86-64: **1–43** straddles and **52–158** cross-generation leaks per 100 000 runs, measured over 10 runs on one machine. That range is an OBSERVATION, not a specification, and it has now been over-tightened twice (13–27 / 86–166, then 9–26 / 55–109) before being blown through in both directions. The claim that matters is: NONZERO on the control, ZERO on the shipped build, 10/10 and 4/4. Read the caveat below about how thin the low end is |
+| **Reset core, `-DRELAXED_SEAL` control** | `gcc` | `just verify-core` | **RAN — FAILS AS INTENDED** on x86-64. **NO RANGE IS QUOTED HERE, deliberately — see "why this row no longer states a band" below.** The claim this row supports is qualitative and is the whole of it: the SHIPPED build produces **zero** straddles and **zero** cross-generation leaks; the `-DRELAXED_SEAL` control produces **nonzero on at least one of its two counters** — in practice single to low-double digits per 100 000. Do not read that as "nonzero on both": the independent verification run of 2026-08-22 measured **0 straddles and 39 cross-generation leaks per 100 000** on this machine, so a per-counter zero is not hypothetical, it has been observed. The gate is the DIRECTION, nonzero versus zero, never a count. A **zero from the control is INCONCLUSIVE, not a pass**: the control is a SAMPLER, and the leg that DECIDES this hazard is GenMC (`just verify-models`), which finds it exhaustively under RC11 and returns a counterexample |
 | **Reset core, aarch64** | cross-gcc + `qemu-aarch64` | `just verify-aarch64` | **RAN — green, FUNCTIONAL ONLY** |
 | **Litmus, C11 language model** | herd7 7.58 (packaged here) | `just verify-litmus` | **RAN — 44/44 as declared.** 11 tests × 4 C11 models (`c11_partialSC`, `c11_orig`, `c11_simp`, `rc11`); every shipped test Never, every `-RELAXED-control` Sometimes |
 | **Litmus, ARMv8 / RISC-V / x86-TSO hardware models** | herd7 7.58 | `just verify-litmus` | **RAN — 11/11 as declared.** See the table below; this is the ARMv8 coverage qemu-user could not give |
@@ -216,15 +236,46 @@ changed at all.
   wrong generation — on this x86-64 machine, within 100 000 runs, while the
   shipped build shows zero of both. Under `qemu-aarch64` the control reports
   ZERO, which is a limitation of qemu-user (see below), not a contradiction.
-  **But the native control is PROBABILISTIC, and thinner than it looks.** One of
-  the ten measured runs found a single straddle in 100 000 — 1, not 9 — so a
-  quieter machine, a different core count, or a different scheduler could
-  plausibly return zero and make the control look like it had passed. Treat a
-  zero from `just verify-core`'s control as "inconclusive, re-run under load",
-  never as "the ordering does not matter". The claim does NOT rest on this:
+  **But the native control is PROBABILISTIC, and thinner than it looks.** Runs
+  have come back with a SINGLE straddle in 100 000 — so a quieter machine, a
+  different core count, or a different scheduler could plausibly return zero and
+  make the control look like it had passed. Treat a zero from
+  `just verify-core`'s control as "inconclusive, re-run under load", never as
+  "the ordering does not matter". The claim does NOT rest on this:
   `just verify-models` demonstrates the same hazard EXHAUSTIVELY under GenMC/
   RC11, where "reachable" is decided rather than sampled, and that is the leg
   that makes the result independent of this machine's timing.
+
+  **Why this row no longer states a band.** It used to, three times over, and
+  every one was blown through by the next independent sampling:
+
+  | # | band recorded (straddles / leaks per 100 000) | how it died |
+  |---|---|---|
+  | 1 | 13–27 / 86–166 | over-tightened; next sampling fell outside |
+  | 2 | 9–26 / 55–109 | over-tightened; next sampling fell outside |
+  | 3 | 1–43 / 52–158 | FOUR consecutive independent runs came in at **2 / 42**, **1 / 39**, **4 / 50** and **0 / 39** — every one below the leak floor of 52, and the fourth below the straddle floor of 1 as well |
+
+  Each band was correctly LABELLED an observation and correctly carried the
+  "a zero is inconclusive" caveat, so none of them was a correctness bug. The
+  problem is structural and is why the practice stops here rather than being
+  re-tightened a fourth time: the control's event rate is a function of the load
+  average, core count and scheduler *at the instant of the run*, so a
+  ten-sample band bounds THAT machine in THAT moment, not the mechanism — and
+  writing it down converts an observation into a number the next honest run is
+  obliged to contradict. It also invites exactly the wrong reading, that a run
+  landing inside the band is a pass and one outside it is a regression, when the
+  only thing the sampler can say is nonzero versus zero. Report the pair of
+  counts the run actually produced if it is useful; do not turn a fresh sample
+  into a range. The leg that DECIDES is GenMC.
+
+  The fourth of those runs is worth naming on its own, because it is the case
+  this section had only ever described as *plausible*: the independent
+  verification run of 2026-08-22 returned **0 straddles** and 39 leaks. The
+  straddle counter — the one the GenMC control keys on — came back CLEAN from a
+  build that is provably broken. Nothing was wrong with the run and nothing is
+  wrong with the mechanism; it is the sampler doing exactly what a sampler does,
+  and it is the concrete reason "treat a zero as inconclusive" is a rule here
+  rather than a hedge.
 - **qemu-aarch64** does **NOT** faithfully reproduce ARM weak memory. The aarch64
   run is a **functional** check (ABI, struct layout, atomic-builtin lowering,
   compile correctness) — it is **not** a weak-memory proof. Real ARM weak-memory
@@ -386,13 +437,16 @@ chain-bump, `acquire` reader loads) on a tiny forced-collision table with two
 producers — the compilation unit a model checker drives, matching the shipped
 algorithm rather than paraphrasing it.
 
-## The three protocol models
+## The four protocol models
 
 `tla/shm_gset.tla` models the **identity** key discipline (`ShmGSetT[IdentityKey]`,
 io-mon): the element is its own key, membership only. `tla/shm_gset_reset.tla`
 models RECYCLING on top of that — the chain generation, generation-stamped
 slots, the producer registry and its seal, and the liveness re-arm (see "The
-reset model has teeth" at the end of this file). `tla/shm_gset_keyed.tla`
+reset model has teeth" at the end of this file). `tla/shm_gset_pool.tla` models
+the HOST-SIDE POOL on top of THAT — the acquire / confirmed-reset / lease /
+release / retire lifecycle N in-flight actions drive around `reset` (see "The
+pool model has teeth too"). `tla/shm_gset_keyed.tla`
 models the **keyed** discipline (`primaryKeySpan` selects a sub-range of the
 element, so a whole SET of elements shares one home slot) with tombstone
 eviction, a global generation counter, flattening and retirement — the discipline
@@ -461,6 +515,14 @@ the reader sees it in neither. This is why `withPrimaryKeyHash`, `contains` and
   over a 2-slot table, `MaxGen = 3` (two recycles).
 - `tla/shm_gset_reset_probes.tla` — the vacuity + teeth probes below, so they can
   be re-derived rather than taken on faith.
+- `tla/shm_gset_pool.tla` — model of the HOST-SIDE RECYCLING POOL lifecycle
+  (HM-3): acquire / confirmed-reset / lease / release / retire, driven by N
+  in-flight actions. Parameterised on three booleans (`ResetOnAcquire`,
+  `ExclusiveIdle`, `RetireOnPermanent`) so each mechanism can be switched OFF
+  and the resulting violation observed.
+- `tla/shm_gset_pool_MC.{tla,cfg}` — the shipped configuration: two workers,
+  two chains, two actions each, `MaxGen = 3`, `BusyBudget = 2`.
+- `tla/shm_gset_pool_probes.tla` — its vacuity probes.
 - `litmus/*.litmus` — herd7 `C` litmus tests, checked against the C11 LANGUAGE
   models. Wired as `just verify-litmus` (tier 1).
 - `litmus/arch/*.litmus` — AArch64 / RISC-V / x86-64 ASSEMBLY translations of the
@@ -517,6 +579,86 @@ NoStraddle == \A p : pact[p] = 0 \/ pgen[p] = 0 \/ pact[p] = pgen[p]
 No producer can ever hold an attach across a generation change. It IS violated
 as soon as either `QuiescenceCheck` or `Sealed` is switched off, which is what
 shows the model can express straddling and that both mechanisms are needed.
+
+## The pool model has teeth too (HM-3)
+
+`tla/shm_gset_pool.tla` models the lifecycle the recycling POOL adds ON TOP of
+`reset`. Stating the scope precisely matters, because it would be easy to read
+this as a second weak-memory artifact and it is not one:
+
+**The pool adds no new SHARED-MEMORY protocol.** Its only segment operations are
+`createSet`, `reset`, `markConsumerGone` and `detach` — every one of them
+already modelled by `shm_gset_reset.tla` and already checked under weak memory
+by `core/shm_gset_reset_core.c`, `litmus/reset-*.litmus` and GenMC/RC11. No new
+atomic, no new ordering, no new access pattern; `verify-core`, `verify-litmus`,
+`verify-models` and `verify-cdschecker` are byte-for-byte unchanged by HM-3 and
+their results carry over unaltered. What the pool DOES add is a concurrent
+LIFECYCLE — acquire, confirmed reset, lease, release, retire, driven by N
+in-flight actions inside one process behind a mutex — and that lifecycle has
+safety properties no existing artifact states. TLC is the right tool for it
+precisely because the lifecycle is mutex-guarded and sequentially consistent.
+
+**And the coverage boundary, stated because it has already cost a regression.**
+`shm_gset_pool.tla` models *one process*. There is no second process in it, no
+`fork`, and no `destroySetPool` — the shutdown half of the lifecycle is `close`
+and `retire` only. So the pool's OWNERSHIP rule ("a pooled chain belongs to the
+process that created it; every mutating entry point refuses from any other
+process") is **not covered by this model at all, and could not be**. That is not
+a hypothetical gap: the round in which the `created` sweep moved into
+`destroySetPool` and the `getpid()` guard was not moved with it produced a fork
+child that unlinked its parent's live chain, and TLC stayed green throughout,
+because there was nothing in the model that could have gone red. The only guards
+on that rule are the two Nim fork tests,
+`a_fork_child_cannot_touch_the_parents_pooled_chain` (covering `acquire` /
+`release` / `close`) and `a_fork_child_cannot_destroy_the_parents_pool`
+(covering `destroySetPool`). **If the guard list in `pool.nim` grows a sixth
+entry point, the test list has to grow with it — the formal tier will not
+notice.** Adding a second process to this model would mean modelling COW address
+spaces and the file namespace, which is a different artifact from the one this
+module is; the decision was to name the boundary rather than blur it.
+
+One state the pool genuinely introduces is a chain that has been marked GONE and
+is sitting idle, dirty, for an unbounded time before its next reset. That is not
+new to the model: `shm_gset_reset.tla` already lets a producer attach at any
+unsealed moment INCLUDING after the consumer has marked itself gone, so both the
+"blocks the reset" and the "fast-fails on the liveness token" paths were already
+explored rather than assumed away.
+
+| Configuration | Result |
+|---|---|
+| shipped (`ResetOnAcquire`, `ExclusiveIdle`, `RetireOnPermanent` all TRUE) | **green** — 7,444 distinct states, depth 15, all 8 invariants and `EventuallyAllServed` hold |
+| `ResetOnAcquire = FALSE` (hand out the idle chain as it is) | **`NeverUnresetHandout` violated** — a worker holds a chain whose generation never moved past the one the pool was holding, i.e. the previous action's evidence |
+| `ExclusiveIdle = FALSE` (a leased chain stays in the idle set) | **`NoSharedChain` violated** — two in-flight actions hold one chain. With `NoSharedChain` removed from the config, **`LeaseGenStable`** is violated as well: the second acquire RECYCLES the chain under the first holder |
+| `RetireOnPermanent = FALSE` (retry an untracked / exhausted chain like a busy one) | **`NoPermanentlyIdleChain` violated** — a chain that can never be recycled again sits in the idle set forever, warm, mapped and useless, looking merely busy |
+
+And the vacuity probes, all confirmed VIOLATED (i.e. the behaviour really is
+reached) against the shipped configuration:
+
+```
+NoConcurrentLeasesProbe -> violated  (two leases ARE in flight at once, so
+                                      NoSharedChain is not vacuously true)
+NoRecycleProbe          -> violated  (a chain really is recycled)
+NoTwoRecyclesProbe      -> violated  (...more than once)
+NoRetireProbe           -> violated  (a chain really is retired)
+NoBusyRetireProbe       -> violated  (the BUSY budget really is exhausted)
+NoPermanentRefusalProbe -> violated  (a PERMANENT refusal really is seen, so
+                                      NoPermanentlyIdleChain is not vacuous)
+NoReleaseProbe          -> violated  (actions really end and hand chains back)
+```
+
+Two abstractions in the pool model are deliberate and are named in the module
+header rather than left to be discovered: the idle list is a SET, not a queue
+(which chain an acquire picks is irrelevant to every invariant; the FIFO
+rotation in the implementation only decides WHEN a refused chain is retried,
+which is quality of service, not safety), and `maxIdle` is omitted (it only ever
+retires MORE chains, which cannot falsify any invariant here). A third is worth
+flagging because it looks like a bound and is not: a RETIRED chain's slot
+returns to `absent`, because a retired chain's files are unlinked and its
+identity is gone, so `Chains` bounds CONCURRENT chains rather than chains over
+time — which matches the implementation, where nothing bounds how many chains a
+pool creates in its life. Without that, TLC reports a spurious liveness failure
+the moment every slot has been retired once; that is an artifact of the bound,
+not a property of the pool, and it was observed before being fixed.
 
 ## Which artifact covers which HALF of the Dekker handshake
 

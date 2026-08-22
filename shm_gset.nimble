@@ -36,6 +36,31 @@ task test, "Build + run the nim-shm-gset test suite":
     "-o:tests/helpers/v2_producer tests/helpers/v2_producer.nim"
   exec "nim c -r --hints:off --threads:on --warning:BareExcept:off " &
     "--path:tests tests/test_shm_gset_version_skew.nim"
+  # Host-side recycling POOL (HM-3): growth stops after warmup (measured against
+  # an unpooled baseline in the same run), the structural guarantee that no
+  # caller can acquire a chain that was not reset, N in-flight actions that
+  # never share a chain, the consumer-identity rule for a pooled chain, and the
+  # retry/retire policy for each `ResetStatus` refusal. Plus the three
+  # properties the milestone asserted in prose before it tested them:
+  # `release` marking the consumer gone for a late producer, what `close`
+  # does and does NOT clean up when a lease was dropped, and that
+  # `destroySetPool` frees the pool's own seq buffers (the valgrind gate for
+  # the same leak lives in the Justfile's `test-valgrind`, since valgrind is
+  # not assumed present here).
+  # `-d:shmGSetScheduleHooks` is REQUIRED, not decorative — the
+  # `rsGenerationExhausted` policy case needs the compile-time-gated generation
+  # seam, so the file does not compile without it and cannot silently degrade.
+  # `--path:tests` lets the negative-compilation fixture be found. Must stay in
+  # step with the Justfile `test` recipe.
+  exec "nim c -r --hints:off --threads:on --warning:BareExcept:off " &
+    "-d:shmGSetScheduleHooks --path:tests tests/test_shm_gset_pool.nim"
+  # The many-process soak oracle, which now also carries HM-3's `recycle_soak`:
+  # N successive recycles through the pool with disjoint input sets, oracle =
+  # each generation's union is EXACTLY its intended set. It is in this task (and
+  # not only in the Justfile, where it always was) because a REQUIRED milestone
+  # test must not be reachable from one runner only.
+  exec "nim c -r --hints:off --threads:on --warning:BareExcept:off " &
+    "tests/test_shm_gset_soak.nim"
   # The same suite compiled with the deterministic schedule hooks enabled, to
   # prove the test-only seams compile and stay behaviour-preserving.
   exec "nim c -r --hints:off --threads:on --warning:BareExcept:off " &

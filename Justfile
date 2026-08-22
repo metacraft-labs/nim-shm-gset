@@ -14,13 +14,30 @@ nim_flags := "--hints:off --threads:on --warning:BareExcept:off --path:src --pat
 # synced. A repo whose product is verification evidence cannot have its evidence
 # depend on that. See flake.nix and verification/README.md.
 #
-# `test`, `soak`, `bench` and the sanitizer/valgrind/rr targets deliberately
-# still use the AMBIENT toolchain (the workspace dev shell), because that is
-# what a developer edits and rebuilds against all day, and because this repo is
-# consumed by io-mon as a plain source path (SHM_GSET_SRC) compiled by io-mon's
-# OWN nim. The flake's shell carries the same Nim version (2.2.4) from the
-# pinned nixpkgs, so `nix develop . -c just test` also works and gives the same
-# 85 [OK] / 0 [FAILED]; it is simply not forced.
+# `test`, `soak`, `bench`, `test-sanitizers` and `test-rr` deliberately still
+# BUILD AND RUN entirely on the AMBIENT toolchain (the workspace dev shell),
+# because that is what a developer edits and rebuilds against all day, and
+# because this repo is consumed by io-mon as a plain source path (SHM_GSET_SRC)
+# compiled by io-mon's OWN nim. The flake's shell carries the same Nim version
+# (2.2.4) from the pinned nixpkgs, so `nix develop . -c just test` also works
+# and gives the same 101 [OK] / 0 [FAILED] / 0 [SKIPPED]; it is simply not
+# forced. (Re-measured 2026-08-22. This number was stale at 97 for two rounds;
+# if you change the suite, re-measure it here and in verification/README.md
+# rather than carrying the old one forward.)
+#
+# `test-valgrind` IS THE ONE EXCEPTION, and it used to be documented wrongly.
+# The comment here and in verification/README.md both said it ran on the ambient
+# toolchain; it never could, because `valgrind` is not in the workspace shell —
+# it is in THIS repo's flake (flake.nix, "§4.5(g) dynamic tier (previously
+# ambient, now pinned too)"), and the doc was not moved when the package was.
+# Measured on the ambient shell: `just test-valgrind` died with
+# `sh: line 1: valgrind: command not found`, exit 127. Rather than leave a
+# target documented as runnable where it was not, the recipe now takes the
+# valgrind BINARY from the pinned flake via {{verify_shell}} while still
+# building the binaries under test with the ambient nim — so `just
+# test-valgrind` works from a bare workspace shell, and the thing being measured
+# is still the build a developer actually produces. `rr` is genuinely ambient
+# (it is in the user profile), so `test-rr` is left alone.
 verify_shell := "nix develop --quiet " + justfile_directory() + " --command"
 
 # Build + run the full functional + concurrency-verification suite (design spec
@@ -50,6 +67,24 @@ test:
     nim c -r {{nim_flags}} -d:shmGSetScheduleHooks tests/test_shm_gset_hooks.nim
     nim c -r {{nim_flags}} -d:shmGSetScheduleHooks tests/test_shm_gset_concurrency.nim
     nim c -r {{nim_flags}} tests/test_shm_gset_threads.nim
+    # Host-side recycling POOL (HM-3): growth stops after warmup (measured
+    # against an unpooled baseline in the same run), the structural guarantee
+    # that no caller can acquire a chain that was not reset, N in-flight actions
+    # that never share a chain, the consumer-identity rule for a pooled chain,
+    # and the retry/retire policy for each `ResetStatus` refusal. Plus the three
+    # properties the milestone asserted in prose before it tested them:
+    # `release` marking the consumer gone for a late producer, what `close`
+    # does and does NOT clean up when a lease was dropped, and that
+    # `destroySetPool` frees the pool's own seq buffers (whose valgrind gate is
+    # in `test-valgrind`).
+    # -d:shmGSetScheduleHooks is REQUIRED, not decorative: the
+    # `rsGenerationExhausted` policy case needs the compile-time-gated
+    # generation seam. Without it the file does not compile, so it cannot
+    # silently degrade into a weaker run. Must stay in step with the nimble task.
+    nim c -r {{nim_flags}} -d:shmGSetScheduleHooks tests/test_shm_gset_pool.nim
+    # Soak: the §4.5(f) many-process oracle, plus (HM-3) `recycle_soak` — N
+    # successive recycles through the pool with disjoint input sets, oracle =
+    # each generation's union is EXACTLY its intended set.
     nim c -r {{nim_flags}} tests/test_shm_gset_soak.nim
     # -d:nimAllocStats instruments the allocator's alloc/dealloc counters, which
     # is what suite E measures. WITHOUT it the runtime returns a zeroed
@@ -80,6 +115,24 @@ test-sanitizers:
         --passc:-fsanitize=thread --passl:-fsanitize=thread \
         -o:/tmp/shmgset-tsan-keyed tests/test_shm_gset_keyed_concurrency.nim
     TSAN_OPTIONS="halt_on_error=1" /tmp/shmgset-tsan-keyed
+    # The recycling POOL under N in-flight actions (HM-3). This one is NOT about
+    # the segment's atomics — it is about the pool's own Nim-level state, and it
+    # is here because it caught a real defect that every functional assertion
+    # passed: a `ref` SetPool races its own ORC refcount across host threads
+    # (ORC counters are atomic only under -d:gcAtomicArc), which TSAN reports as
+    # races on `nimIncRef` / `nimDecRef` from `acquire` / `release` in two
+    # different worker threads, and which manifests in the wild as a SIGSEGV
+    # inside the runtime, far from the code responsible. The gate is NONZERO vs
+    # ZERO, not a count: TSAN reports per observed schedule, so the number of
+    # races on a `ref` build varies run to run and is not a specification. The
+    # shipped `ptr` SetPool + lock-guarded GC'd fields is clean. Only the
+    # concurrency case is run: the rest of that file forks, and TSAN and fork do
+    # not mix.
+    nim c {{nim_flags}} -d:shmGSetScheduleHooks --mm:orc -d:useMalloc --debugger:native \
+        --passc:-fsanitize=thread --passl:-fsanitize=thread \
+        -o:/tmp/shmgset-tsan-pool tests/test_shm_gset_pool.nim
+    TSAN_OPTIONS="halt_on_error=1" /tmp/shmgset-tsan-pool \
+        pool_under_concurrency_never_shares_a_chain
 
 # Longer parameterizable many-process soak (design spec §4.5(f)). The default in
 # `test` is a short 2s; use this for a longer bounded run, e.g. `just soak 300`.
@@ -99,13 +152,34 @@ soak seconds="60":
 # cross-mapping release->acquire ordering is proven by the formal/litmus
 # artifacts (verification/) and exercised by the multi-process kill/oracle tests.
 # Both tools run clean (0 errors), so no suppression file is needed.
+#
+# The BINARIES are built with the ambient nim (the build a developer actually
+# produces); only the `valgrind` executable comes from the pinned flake, because
+# it is not in the workspace shell at all — see the note at the top of this file
+# for the measurement that established that.
 test-valgrind:
     nim c {{nim_flags}} --mm:orc -d:useMalloc --debugger:native \
         -o:/tmp/shmgset-vg-threads tests/test_shm_gset_threads.nim
-    SHM_GSET_THREADS=3 SHM_GSET_PER_THREAD=200 \
+    {{verify_shell}} env SHM_GSET_THREADS=3 SHM_GSET_PER_THREAD=200 \
         valgrind --tool=helgrind --error-exitcode=99 /tmp/shmgset-vg-threads
-    SHM_GSET_THREADS=3 SHM_GSET_PER_THREAD=200 \
+    {{verify_shell}} env SHM_GSET_THREADS=3 SHM_GSET_PER_THREAD=200 \
         valgrind --tool=drd --error-exitcode=99 /tmp/shmgset-vg-threads
+    # MEMCHECK over a complete pool lifecycle (HM-3) — NOT a race check. The
+    # pool object is `allocShared0` memory, which carries no destructor, so a
+    # GC'd field of it that is merely TRUNCATED before `deallocShared`
+    # (`seq.setLen(0)` keeps the payload buffer) is orphaned: a real
+    # 136-bytes-per-pool leak, paid by every host that creates a pool per build
+    # or per worker generation. `--errors-for-leak-kinds=definite` fails on
+    # exactly that class and ignores the reachable-at-exit allocations Nim's
+    # runtime intentionally leaves, which is why `detect_leaks=0` is right for
+    # the sanitizer targets above and a leak gate is right here. The suite-side
+    # guard for the same property is
+    # `destroySetPool_frees_the_pools_own_buffers`.
+    nim c {{nim_flags}} --mm:orc -d:useMalloc --debugger:native \
+        -o:/tmp/shmgset-vg-pool tests/helpers/pool_lifecycle_probe.nim
+    {{verify_shell}} valgrind --tool=memcheck --leak-check=full \
+        --errors-for-leak-kinds=definite --error-exitcode=99 \
+        /tmp/shmgset-vg-pool
 
 # TLA+/TLC model check of the protocol (design spec §4.5(a)). TLC comes from the
 # pinned flake (see `verify_shell` above). The PlusCal algorithm is already
@@ -131,6 +205,18 @@ verify-tla:
     # token is never gone under a generation that is accepting inserts.
     cd verification/tla && {{verify_shell}} \
         tlc -workers 4 -config shm_gset_reset_MC.cfg shm_gset_reset_MC.tla
+    # HOST-SIDE RECYCLING POOL (HM-3): the acquire / reset / lease / release /
+    # retire lifecycle N in-flight actions drive around `reset`. The pool adds
+    # no new SHARED-MEMORY protocol — its only segment operations are the ones
+    # the reset model above and the C11 cores already cover — but it does add a
+    # concurrent LIFECYCLE whose safety properties nothing else states: no two
+    # actions share a chain, no chain is ever handed out whose generation did
+    # not advance past the one the pool was holding (i.e. it was reset), a
+    # leased chain is never recycled under its holder, retirement is final, no
+    # chain is lost track of, and a permanently unrecyclable chain is retired
+    # rather than kept warm forever.
+    cd verification/tla && {{verify_shell}} \
+        tlc -workers 4 -config shm_gset_pool_MC.cfg shm_gset_pool_MC.tla
 
 # The C11 atomics cores (design spec §4.5(a)) as a native functional smoke, plus
 # the RELAXED_SEAL control. The control is expected to REPORT straddles and

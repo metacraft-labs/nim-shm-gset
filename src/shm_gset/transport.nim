@@ -152,6 +152,14 @@ proc reset*(h: var SetHost; runId: string): ResetStatus =
   ## `discardable` either.
   h.s.reset(runId)
 
+when shmGSetSupported and defined(shmGSetScheduleHooks):
+  proc forceGenerationForTest*(h: var SetHost; g: uint64) =
+    ## TEST-ONLY seam (`-d:shmGSetScheduleHooks`), the host-side pass-through of
+    ## `shm_gset.forceGenerationForTest`. It exists so the recycling POOL's
+    ## `rsGenerationExhausted` policy is reachable in a test instead of after
+    ## 4.29e9 real recycles. Compile-time gated, so it cannot ship.
+    h.s.forceGenerationForTest(g)
+
 proc finish*(h: var SetHost) =
   ## End the host lifecycle: announce the consumer is gone (so any late producer
   ## `emit` fast-fails with `emConsumerGone`), then unmap. Terminal for THIS
