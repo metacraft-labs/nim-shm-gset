@@ -38,7 +38,7 @@ gcc 14.3.0: compiles fine, then exits 66 on that FATAL before a single
 iteration.)
 
 The boundary is *almost* exactly `verify-*`. `just test`, `just soak`,
-`just bench` and the `test-sanitizers` / `test-rr` targets deliberately keep
+`just bench` and `test-sanitizers` deliberately keep
 using the AMBIENT workspace toolchain, end to end — that is what a developer
 edits against all day, and io-mon consumes this repo as a plain source path
 compiled by io-mon's own Nim. The rows below that say "(dev shell)" mean that
@@ -47,6 +47,44 @@ gives the same **101 `[OK]` / 0 `[FAILED]` / 0 `[SKIPPED]`** (re-measured
 2026-08-22); it is simply not forced. That count sat stale at 97 for two rounds
 while the suite grew to 100 and then 101 — if you change the suite, re-measure
 it here and in the `Justfile` header rather than carrying the old one forward.
+
+**There are TWO runners, and until now they ran different suites.** The
+`test` recipe in the `Justfile` and the `test` task in `shm_gset.nimble` are
+both entry points to the same suite, and both files carried comments asserting
+the rule that a required milestone test must not be reachable from one runner
+only. Nothing checked it, and it was false: measured 2026-08-22, `just test`
+reported **101 `[OK]`** and `nimble test` **85**. The missing 16 were four whole
+files registered in the `Justfile` alone —
+`tests/test_shm_gset_concurrency.nim` (9: the §4.5 SIGKILL fault-injection
+battery at `spBeforeSlotCas` / `spBeforeArenaPublish` / `spBeforeShardLink` /
+`spBeforeChainBump`, concurrent double shard-link with no leaked file,
+position-independence at a different mmap base, the arena release-publish
+visibility case, and the reaper `flock` race), `test_shm_gset_transport.nim`
+(4: the LF-1 union gate and the LF-2 `emUnavailable` / `emOversize`
+fail-fasts), `test_shm_gset_lf5.nim` (2) and `test_shm_gset_threads.nim` (1,
+which is also the compilation unit `test-sanitizers` and `test-valgrind`
+build under TSAN / helgrind / DRD). It went unseen for months for a mundane
+reason: `nimble` was in neither the workspace shell nor this flake, so
+`nimble test` exited 127 and the task had only ever been reviewed by READING.
+`nimble` is in `flake.nix` now, the four files are registered, and both runners
+measure **101 / 0 / 0** over the same test-name set.
+
+That is a fix, not a guard, so there is a guard too:
+`scripts/check-runner-parity.sh` re-derives from both files the set of
+`tests/*.nim` each runner compiles AND the flag set each is compiled with, and
+fails on any difference — plus on a `tests/test_*.nim` on disk that neither
+runner builds. It runs as the first step of the `Justfile` `test` recipe (via
+`just check-runner-parity`) and as the first `exec` of the nimble task, so
+neither runner can be used while they disagree. Flags are compared, not just
+file names, because a file built with `-d:shmGSetScheduleHooks` under one runner
+and without it under the other is a silently WEAKER run that both runners would
+still report with the same `[OK]` count. It fails CLOSED: a recipe or task it
+cannot parse (zero compiles found) is an error, never a pass. Mutation-checked
+five ways — dummy test file in the `Justfile` only, in the nimble task only, on
+disk in neither, a flag-only divergence (`-d:shmGSetScheduleHooks` dropped from
+one side), and a renamed nimble task yielding zero parsed compiles — each exits
+1 on the assertion it names, with the tree restored and re-verified green by
+checksum afterwards.
 
 **`test-valgrind` is the exception, and this paragraph used to get it wrong.**
 It was described here and in the `Justfile` as an ambient target, but `valgrind`
@@ -61,6 +99,20 @@ pinned flake, so `just test-valgrind` works from a bare workspace shell —
 re-measured after the change, exit 0, helgrind and DRD 0 errors, memcheck
 `All heap blocks were freed`. Rows below that name valgrind therefore say
 "(pinned flake)".
+
+**`test-rr` was the same defect, found by re-running the same measurement.**
+Both this file and the `Justfile` asserted that `rr` is ambient — the `Justfile`
+went further and said it is "genuinely ambient (it is in the user profile)". A
+user profile is not the workspace toolchain: measured on a bare workspace shell,
+`command -v rr` is EMPTY and `just test-rr` failed with
+`verification/run-rr-chaos.sh: line 40: rr: command not found` /
+`FAIL: rr record iteration 1 exited 127`. Unlike valgrind nothing had to move —
+`rr` was already in this repo's `flake.nix`; only the wiring was missing.
+`verification/run-rr-chaos.sh` now resolves the rr BINARY from the pinned flake
+(ONE resolution shared by record and replay, because a trace can only be replayed
+by the rr that recorded it; `SHM_GSET_RR` overrides) while still building the
+soak harness with the ambient nim. Re-measured after the change: green from the
+ambient shell AND from a bare workspace shell.
 
 ```
 just verify            # the whole tier
@@ -82,7 +134,7 @@ just verify-aarch64    # cross-build + qemu-user (FUNCTIONAL only)
 | **Recycling POOL under N in-flight actions (HM-3)** | TSAN (dev shell) | `just test-sanitizers` | **RAN — 0 races.** Not about the segment's atomics: about the pool's own Nim-level state. It EARNED its place — the pool was first a `ref object`, on which TSAN reports **races on the pool's own refcount** (`nimIncRef`/`nimDecRef` from `acquire`/`release` in two worker threads; ORC counters are atomic only under `-d:gcAtomicArc`), and which crashed in the runtime intermittently — a minority of whole-file runs, sampled between roughly one in six and one in eight — while passing every functional assertion. **The gate is NONZERO vs ZERO, not a count:** TSAN reports per observed schedule, so the number of races on a `ref` build is not a specification, exactly as the `-DRELAXED_SEAL` control's straddle counts are not. The shipped `ptr` + lock-guarded GC'd fields is clean |
 | Valgrind DRD + helgrind | `valgrind` (pinned flake; binaries built ambient) | `just test-valgrind` | **RAN — 0 errors** (both tools) |
 | **Pool lifecycle leak gate (HM-3)** | `valgrind` memcheck (pinned flake; binary built ambient) | `just test-valgrind` | **RAN — 0 errors, all heap blocks freed.** `tests/helpers/pool_lifecycle_probe.nim` under `--leak-check=full --errors-for-leak-kinds=definite`. NOT a race check: `SetPoolObj` is `allocShared0` memory with no destructor, so a GC'd field merely TRUNCATED before `deallocShared` is orphaned — 136 bytes definitely lost PER POOL. Quote the per-pool figure, not a whole-program one: `pool_lifecycle_probe.nim` drives TWO pool lifecycles, so reverting the fix measures **272 bytes definitely lost in 2 blocks, `ERROR SUMMARY: 2 errors from 2 contexts`**, exit 99 — the "1 error from 1 context" recorded during the original diagnosis came from a one-pool scratch program that is not what this gate runs |
-| rr chaos record + replay | `rr` (dev shell) | `just test-rr` | **RAN — green.** Oracle held across 5 chaos schedules + 1 deterministic replay |
+| rr chaos record + replay | `rr` (pinned flake; harness built ambient) | `just test-rr` | **RAN — green.** Oracle held across 5 chaos schedules + 1 deterministic replay |
 | Longer bounded soak | Nim (dev shell) | `just soak <secs>` | **RAN — green** (60 s: distinct=7200, growthFailures=0) |
 | C11 atomics core, native | `gcc` (dev shell) | `core/` `-DSTANDALONE` | **RAN — green** (200000 slot-claim races) + TSAN clean |
 | C11 atomics core, aarch64 | cross-gcc + `qemu-aarch64` | `core/build-aarch64-qemu.sh` | **RAN — green, FUNCTIONAL ONLY** (see caveat) |

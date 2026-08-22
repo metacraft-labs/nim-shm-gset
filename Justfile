@@ -3,7 +3,14 @@
 # `nimble test` also works, but only once the repo has at least one commit
 # (nimble derives the package version from the VCS revision). This `just`
 # runner needs no commit, so it is the blessed runner during development.
-
+# The two runners are now held to the SAME suite by `just check-runner-parity`,
+# which both of them run first — see the note above that recipe. `nimble` itself
+# is in this repo's flake (it is NOT in the workspace shell), so
+# `nix develop . -c nimble test` is how the second runner is exercised.
+#
+# `nim_flags` below is one half of the parity contract: the nimble task's
+# `const testFlags` must be byte-identical to it, and the gate checks that by
+# expanding both and comparing per-file flag sets.
 nim_flags := "--hints:off --threads:on --warning:BareExcept:off --path:src --path:tests"
 
 # Every VERIFICATION tool (tlc, herd7, genmc, nidhugg, cdschecker, gcc, the
@@ -36,13 +43,38 @@ nim_flags := "--hints:off --threads:on --warning:BareExcept:off --path:src --pat
 # valgrind BINARY from the pinned flake via {{verify_shell}} while still
 # building the binaries under test with the ambient nim — so `just
 # test-valgrind` works from a bare workspace shell, and the thing being measured
-# is still the build a developer actually produces. `rr` is genuinely ambient
-# (it is in the user profile), so `test-rr` is left alone.
+# is still the build a developer actually produces.
+#
+# `test-rr` WAS THE SAME DEFECT, and this comment used to assert the opposite —
+# that `rr` is "genuinely ambient (it is in the user profile)". A user profile is
+# not the workspace toolchain. Measured: `command -v rr` is EMPTY in a bare
+# `nix develop <workspace>`, and `just test-rr` from one failed with
+# `verification/run-rr-chaos.sh: line 40: rr: command not found` /
+# `FAIL: rr record iteration 1 exited 127`. rr was already IN this repo's flake;
+# only the wiring was missing. `verification/run-rr-chaos.sh` now resolves the rr
+# BINARY from the pinned flake (one resolution for both record and replay — a
+# trace can only be replayed by the rr that recorded it) while still building the
+# harness with the ambient nim, exactly as `test-valgrind` does.
 verify_shell := "nix develop --quiet " + justfile_directory() + " --command"
+
+# TWO RUNNERS, ONE SUITE — and until now nothing checked that they agreed.
+# `just test` compiled 101 [OK] worth of tests and `nimble test` 85: four files
+# (transport, lf5, concurrency, threads — 16 cases, including the whole §4.5
+# SIGKILL fault-injection battery and the LF-1/LF-2 lossless-capture gates) were
+# reachable from THIS file only, for months, while both this recipe and the
+# nimble task carried comments stating the rule that forbids it. The divergence
+# was DISCOVERED (once nimble was finally installed and could be run at all),
+# not caught. This gate re-derives the compiled file set AND the per-file flag
+# set from both runner definitions and fails on any difference — including a
+# test file on disk that neither runner builds. It is the first step of `test`
+# here and the first `exec` of the nimble task, so neither runner can be used
+# while they disagree. See scripts/check-runner-parity.sh.
+check-runner-parity:
+    bash scripts/check-runner-parity.sh
 
 # Build + run the full functional + concurrency-verification suite (design spec
 # §4.5). x86-64 Linux. Deterministic — no flaky stress in `test`.
-test:
+test: check-runner-parity
     nim c -r {{nim_flags}} tests/test_shm_gset.nim
     nim c -r {{nim_flags}} tests/test_shm_gset_transport.nim
     nim c -r {{nim_flags}} tests/test_shm_gset_lf5.nim
@@ -309,6 +341,8 @@ verify: verify-tla verify-core verify-litmus verify-models verify-cdschecker ver
 # scheduler; every recording asserts `snapshot == union(intended)`. rr needs a HW
 # CPU-cycle counter; on Intel hybrid parts pass RR_BIND_CPU to pin a P-core (the
 # script defaults to cpu0). Tune with RR_CHAOS_ITERS / SHM_GSET_SOAK_SECONDS.
+# The harness is built with the ambient nim; the rr BINARY comes from this repo's
+# pinned flake (see the note at the top of this file, and SHM_GSET_RR to override).
 test-rr:
     bash verification/run-rr-chaos.sh
 

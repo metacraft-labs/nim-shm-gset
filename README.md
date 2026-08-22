@@ -538,6 +538,16 @@ just verify   # the whole §4.5 formal / weak-memory tier, all tools from flake.
 just bench    # M1 transport head-to-head vs nim-shm-queue (needs ../nim-shm-queue)
 ```
 
+Both runners cover the SAME suite — 101 `[OK]` / 0 `[FAILED]` / 0 `[SKIPPED]`
+each — and that is enforced rather than trusted. They diverged for months
+(`just test` 101, `nimble test` 85: four files were registered in the Justfile
+alone, including the §4.5 SIGKILL fault-injection battery), unnoticed because
+`nimble` was not installed anywhere and `nimble test` simply exited 127.
+`nimble` is in `flake.nix` now, and `just check-runner-parity` —
+`scripts/check-runner-parity.sh`, the first step of BOTH runners — fails if the
+two disagree on which `tests/*.nim` they compile, on the flags any of them is
+compiled with, or if a `tests/test_*.nim` on disk is registered with neither.
+
 `just verify` fans out to `verify-tla`, `verify-core`, `verify-litmus`,
 `verify-models`, `verify-cdschecker` and `verify-aarch64`; every tool comes from
 this repo's pinned flake rather than `nix shell nixpkgs#…`.

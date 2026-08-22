@@ -115,6 +115,17 @@
               # Build + functional suite. Same Nim VERSION (2.2.4) the
               # workspace shell provides, from the pinned nixpkgs.
               pkgs.nim
+              # nimble is a SEPARATE derivation: nixpkgs' `nim` is a wrapper
+              # that ships nim, nimsuggest, nimpretty, nimgrep and testament,
+              # but NOT nimble. This repo has two test runners — the Justfile
+              # `test` recipe and the `test` task in shm_gset.nimble — and the
+              # campaign's own rule is that a required test must not be
+              # reachable from one runner only. That rule could not be CHECKED
+              # here: nimble was in neither the workspace shell nor this flake,
+              # so `nimble test` exited 127 and the nimble task had only ever
+              # been reviewed by reading it. It is in the shell now so the two
+              # runners can actually be reconciled by running them.
+              pkgs.nimble
               pkgs.just
               pkgs.pkg-config
 

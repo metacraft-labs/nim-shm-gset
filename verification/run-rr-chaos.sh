@@ -22,6 +22,30 @@ iters="${RR_CHAOS_ITERS:-5}"
 soak_secs="${SHM_GSET_SOAK_SECONDS:-1}"
 nim_flags="--hints:off --threads:on --warning:BareExcept:off --path:$root/src"
 
+# The rr BINARY comes from this repo's pinned flake, exactly like `valgrind` in
+# `just test-valgrind`, and for exactly the same measured reason: rr is NOT in
+# the workspace dev shell. `command -v rr` is EMPTY inside a bare
+# `nix develop <workspace>`, and `just test-rr` from one died with
+#   verification/run-rr-chaos.sh: line 40: rr: command not found
+#   FAIL: rr record iteration 1 exited 127
+# It only appeared to be ambient because it happens to sit in one developer's
+# personal `~/.nix-profile`. The Justfile header and verification/README.md both
+# described this target as ambient end-to-end; that was the same documentation
+# drift already corrected for valgrind.
+#
+# Only the rr binary is pinned. The harness under test is still BUILT with the
+# ambient `nim` below — the build a developer actually produces — which is the
+# whole point of keeping this target out of the `verify-*` tier.
+#
+# One resolution for both record and replay: an rr trace can only be replayed by
+# the rr that recorded it, so these must never come from different places.
+# Override with SHM_GSET_RR (a single executable path) if you need a specific rr.
+if [ -n "${SHM_GSET_RR:-}" ]; then
+  rr_cmd=("$SHM_GSET_RR")
+else
+  rr_cmd=(nix develop --quiet "$root" --command rr)
+fi
+
 bin="$(mktemp -u /tmp/shmgset-rr-soak.XXXXXX)"
 trace_dir="$(mktemp -d /tmp/shmgset-rr-trace.XXXXXX)"
 export _RR_TRACE_DIR="$trace_dir"
@@ -37,7 +61,7 @@ echo "== rr chaos record x$iters (SHM_GSET_SOAK_SECONDS=$soak_secs, cpu=$bind_cp
 for i in $(seq 1 "$iters"); do
   echo "-- chaos record iteration $i --"
   out="$(SHM_GSET_SOAK_SECONDS="$soak_secs" \
-    rr record -h --bind-to-cpu="$bind_cpu" -o "$trace_dir/trace$i" "$bin" 2>&1)"
+    "${rr_cmd[@]}" record -h --bind-to-cpu="$bind_cpu" -o "$trace_dir/trace$i" "$bin" 2>&1)"
   rc=$?
   echo "$out" | grep -E "OK|soak|Assert|Error|FAIL" || true
   if [ "$rc" -ne 0 ]; then
@@ -48,7 +72,7 @@ for i in $(seq 1 "$iters"); do
 done
 
 echo "== deterministic replay of trace1 (proves reproducibility) =="
-rout="$(rr replay -a "$trace_dir/trace1" 2>&1)"; rrc=$?
+rout="$("${rr_cmd[@]}" replay -a "$trace_dir/trace1" 2>&1)"; rrc=$?
 echo "$rout" | grep -E "OK|soak|Assert|Error" || true
 if [ "$rrc" -ne 0 ]; then
   echo "FAIL: rr replay exited $rrc" >&2; exit 1
