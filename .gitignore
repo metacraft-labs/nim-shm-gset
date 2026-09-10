@@ -28,3 +28,8 @@ verification/core/*.o
 verification/core/shm_gset_core_run
 verification/core/shm_gset_core_aarch64
 verification/core/shm_gset_reset_core_run
+
+# Macro source maps emitted by the test runner (regenerated on every `just test`).
+# Untracked build output; they dirty the tree and block the pre-push gate.
+macro_sourcemap_*.json
+tests/helpers/macro_sourcemap_*.json
