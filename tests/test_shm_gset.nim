@@ -248,6 +248,48 @@ suite "reaper (cross-restart GC)":
     check reaped >= 1
     check (not fileExists(staleAnchor))   # wrong-boot chain reaped despite live pid
 
+  test "the boot identity is stable across a real elapsed second":
+    # THE HEADER GUARD IS ONLY AS GOOD AS THE IDENTITY IT COMPARES. `bootId`
+    # decides whether a shard chain found on disk belongs to THIS boot or to a
+    # previous one, and a chain judged stale is recreated EMPTY. So a `bootId`
+    # that drifts within one boot does not merely weaken the guard, it silently
+    # discards live data — and it reports nothing, because a freshly recreated
+    # chain is indistinguishable from a genuinely new one.
+    #
+    # On macOS the fallback was `getTime().toUnix()`, i.e. it changed every
+    # second. Measured before the fix: create a chain, insert an element, wait
+    # three seconds, attach from a second process — the attach SUCCEEDS and the
+    # element count is zero. For io-mon that never showed, because its
+    # dependency-capture channel is Linux-only and its chains live for the
+    # length of one monitored action; a host-wide, long-lived consumer meets it
+    # immediately.
+    #
+    # Two seconds of real elapsed time is the whole test. It is enough because
+    # the defect was exactly a one-second granularity, and no shorter wait can
+    # distinguish "constant" from "constant for less than a second".
+    let first = bootId()
+    check first != 0'u64
+    sleep(2_100)
+    check bootId() == first
+
+  test "a chain outlives the second it was created in":
+    # The end-to-end consequence of the identity above, at the level a consumer
+    # actually observes: an element inserted now must still be there after the
+    # clock has moved, when read through a FRESH attach that re-derives the boot
+    # id rather than inheriting the creator's handle.
+    let dir = freshDir("bootstable")
+    defer: removeDir(dir)
+    var owner = createSet(dir, "io-mon", "run-boot-stable")
+    check owner.available
+    check owner.insert(@[1'u8, 2, 3, 4]) == isInserted
+    sleep(2_100)
+    var later = attachSet(owner.path0)
+    check later.attachFailure() == afNone
+    check later.available
+    check later.contains(@[1'u8, 2, 3, 4])
+    later.detach()
+    owner.detach()
+
   test "cross-app isolation: a reaper only reaps its OWN appId's segments":
     # THE KEY NEW GUARANTEE. Two DIFFERENT apps (A and B) share one segments
     # directory. A's owner is DEAD (so a NON-scoped reaper WOULD reap it). Assert

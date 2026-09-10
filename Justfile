@@ -27,7 +27,7 @@ nim_flags := "--hints:off --threads:on --warning:BareExcept:off --path:src --pat
 # because this repo is consumed by io-mon as a plain source path (SHM_GSET_SRC)
 # compiled by io-mon's OWN nim. The flake's shell carries the same Nim version
 # (2.2.4) from the pinned nixpkgs, so `nix develop . -c just test` also works
-# and gives the same 101 [OK] / 0 [FAILED] / 0 [SKIPPED]; it is simply not
+# and gives the same 102 [OK] / 0 [FAILED] / 0 [SKIPPED]; it is simply not
 # forced. (Re-measured 2026-08-22. This number was stale at 97 for two rounds;
 # if you change the suite, re-measure it here and in verification/README.md
 # rather than carrying the old one forward.)
@@ -58,7 +58,7 @@ nim_flags := "--hints:off --threads:on --warning:BareExcept:off --path:src --pat
 verify_shell := "nix develop --quiet " + justfile_directory() + " --command"
 
 # TWO RUNNERS, ONE SUITE — and until now nothing checked that they agreed.
-# `just test` compiled 101 [OK] worth of tests and `nimble test` 85: four files
+# `just test` compiled 102 [OK] worth of tests and `nimble test` 85: four files
 # (transport, lf5, concurrency, threads — 16 cases, including the whole §4.5
 # SIGKILL fault-injection battery and the LF-1/LF-2 lossless-capture gates) were
 # reachable from THIS file only, for months, while both this recipe and the
