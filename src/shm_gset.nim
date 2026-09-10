@@ -636,8 +636,36 @@ when shmGSetSupported:
     atomicCompareExchangeN(atField(base, off, uint32), addr expected, desired,
       false, ATOMIC_ACQ_REL, ATOMIC_ACQUIRE)
 
+  when defined(macosx):
+    proc sysctlbyname(name: cstring; oldp: pointer; oldlenp: ptr csize_t;
+        newp: pointer; newlen: csize_t): cint
+      {.importc, header: "<sys/sysctl.h>".}
+
   proc bootId*(): uint64 =
-    ## Per-boot identity (invalidates a stale post-reboot shard). Never zero.
+    ## Per-boot identity — the value the header guard compares a shard's
+    ## creator against, so that a chain surviving in a file-backed directory
+    ## across a REBOOT is judged stale and recreated rather than read.
+    ## Never zero.
+    ##
+    ## IT MUST BE CONSTANT FOR THE LIFE OF A BOOT, and on macOS it was not. The
+    ## fallback below is `now()`, which changes every second, so on Darwin two
+    ## processes attaching a chain one second apart disagreed about the boot and
+    ## the second one judged a perfectly live chain stale. For io-mon that was
+    ## invisible — its dependency-capture channel is Linux-only and reads
+    ## `/proc/sys/kernel/random/boot_id`. For a chain that is HOST-WIDE and
+    ## LONG-LIVED, as reprobuild's action-cache index is, it is fatal in a quiet
+    ## way: every engine start recreates the chain empty, the tier is
+    ## permanently cold, and nothing reports an error because a cold index is
+    ## indistinguishable from a new one. Measured before the fix: insert an
+    ## element, wait three seconds, attach from another process — `available`
+    ## is true and the element count is zero.
+    ##
+    ## `kern.boottime` is the authoritative answer on Darwin: a `struct
+    ## timeval` fixed at boot, to microsecond resolution, so it also
+    ## distinguishes two boots inside one second. The wall-clock fallback is
+    ## kept only for a platform that has neither source; on such a host a chain
+    ## is recreated more often than it needs to be, which costs a warm-up and
+    ## never correctness.
     when defined(linux):
       try:
         let raw = readFile("/proc/sys/kernel/random/boot_id")
@@ -647,6 +675,15 @@ when shmGSetSupported:
             h = (h xor uint64(ord(ch))) * 1099511628211'u64
         return (h or 1'u64)
       except CatchableError: discard
+    elif defined(macosx):
+      var tv: Timeval
+      var size = csize_t(sizeof(tv))
+      if sysctlbyname("kern.boottime", addr tv, addr size, nil, 0) == 0 and
+          size == csize_t(sizeof(tv)):
+        let secs = uint64(tv.tv_sec)
+        let usecs = uint64(tv.tv_usec)
+        if secs != 0'u64:
+          return ((secs * 1_000_000'u64 + usecs) or 1'u64)
     (uint64(getTime().toUnix()) or 1'u64)
 
   const
