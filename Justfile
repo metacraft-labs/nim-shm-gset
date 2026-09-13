@@ -27,10 +27,24 @@ nim_flags := "--hints:off --threads:on --warning:BareExcept:off --path:src --pat
 # because this repo is consumed by io-mon as a plain source path (SHM_GSET_SRC)
 # compiled by io-mon's OWN nim. The flake's shell carries the same Nim version
 # (2.2.4) from the pinned nixpkgs, so `nix develop . -c just test` also works
-# and gives the same 102 [OK] / 0 [FAILED] / 0 [SKIPPED]; it is simply not
-# forced. (Re-measured 2026-08-22. This number was stale at 97 for two rounds;
-# if you change the suite, re-measure it here and in verification/README.md
-# rather than carrying the old one forward.)
+# and gives the same [OK] / 0 [FAILED] / 0 [SKIPPED]; it is simply not
+# forced. (Re-measured 2026-09-14. This number was stale at 97 for two rounds,
+# then at 102 for one more; if you change the suite, re-measure it here and in
+# verification/README.md rather than carrying the old one forward.)
+#
+# THE COUNT IS NOW PER-PLATFORM, because the suite runs natively on Windows too:
+#
+#   Linux   x86-64   114 [OK]  0 [FAILED]  0 [SKIPPED]
+#   Windows x86-64   112 [OK]  0 [FAILED]  0 [SKIPPED]  + 3 NOT-APPLICABLE
+#
+# The two reconcile exactly. Three cases assert POSIX PROCESS SEMANTICS that
+# have no Windows counterpart — a `fork` child holding an inherited `ptr
+# SetPool` (two cases) or an inherited attached handle (one) — and are declared
+# with `notApplicableHere`, which does NOT register them with unittest, so the
+# Windows count DROPS rather than reporting [OK] for a case that asserted
+# nothing. One case runs on Windows ONLY (`shrinking a MAPPED file` in
+# test_shm_gset_platform.nim, which pins a Win32-specific restriction). So
+# 114 = 112 + 3 - 1.
 #
 # `test-valgrind` IS THE ONE EXCEPTION, and it used to be documented wrongly.
 # The comment here and in verification/README.md both said it ran on the ambient
@@ -75,6 +89,14 @@ check-runner-parity:
 # Build + run the full functional + concurrency-verification suite (design spec
 # §4.5). x86-64 Linux. Deterministic — no flaky stress in `test`.
 test: check-runner-parity
+    # The OS contract the port rests on, asserted on whichever platform this is
+    # running on rather than assumed from documentation: a mapped view outliving
+    # its descriptor, a view staying coherent after the name is unlinked (with a
+    # descriptor still open — the reaper's own sequence, and the case that makes
+    # the Win32 share mode load-bearing), exclusive publish, the whole-file lock
+    # excluding another process, `processAlive`, and a boot identity that is the
+    # same in a second process a second later.
+    nim c -r {{nim_flags}} tests/test_shm_gset_platform.nim
     nim c -r {{nim_flags}} tests/test_shm_gset.nim
     nim c -r {{nim_flags}} tests/test_shm_gset_transport.nim
     nim c -r {{nim_flags}} tests/test_shm_gset_lf5.nim

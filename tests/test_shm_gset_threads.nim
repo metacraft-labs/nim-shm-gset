@@ -13,7 +13,7 @@
 ## the same-process concurrent-grow path (heavy sharding), i.e. the temp-name
 ## uniqueness fix.
 
-import std/[os, posix, sets, strutils]
+import std/[os, sets, strutils]
 import shm_gset
 
 # Geometry defaults match the historical fast functional/TSAN run. They can be
@@ -45,7 +45,7 @@ proc inserter(id: int) {.thread.} =
     s.detach()
 
 when isMainModule:
-  let dir = getTempDir() / ("shmgset-threads-" & $getpid())
+  let dir = getTempDir() / ("shmgset-threads-" & $getCurrentProcessId())
   removeDir(dir); createDir(dir)
   # Small geometry so the many threads force real concurrent sharding.
   var host = createSet(dir, "io-mon", "edge", shard0Cap = 128, shard0ArenaCap = 8192)

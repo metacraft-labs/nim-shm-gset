@@ -32,14 +32,14 @@
 ##   G. FLATTEN AND RETIRE — copy-forward then drain then unlink never makes an
 ##      observable element unobservable.
 
-import std/[algorithm, os, posix, random, sets, sha1, strutils, tables, unittest]
+import std/[algorithm, os, random, sets, sha1, strutils, tables, unittest]
 import shm_gset
 import ac_index_model
 
 var tmpCtr = 0
 proc freshDir(tag: string): string =
   inc tmpCtr
-  result = getTempDir() / ("shmgset-keyed-" & tag & "-" & $getpid() & "-" & $tmpCtr)
+  result = getTempDir() / ("shmgset-keyed-" & tag & "-" & $getCurrentProcessId() & "-" & $tmpCtr)
   removeDir(result)
   createDir(result)
 

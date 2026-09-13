@@ -27,18 +27,12 @@
 ##      layout is still collected. It can no longer be attached, so leaving it
 ##      behind would leak it forever.
 
-import std/[os, posix, strutils, unittest]
+import std/[os, strutils, unittest]
 import shm_gset
-
-proc cExit(code: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
-proc quitChild(code: cint) {.noreturn.} = cExit(code)
+import ./xproc
 
 var tmpCtr = 0
-proc freshDir(tag: string): string =
-  inc tmpCtr
-  result = getTempDir() / ("shmgset-reapid-" & tag & "-" & $getpid() & "-" & $tmpCtr)
-  removeDir(result)
-  createDir(result)
+proc freshDir(tag: string): string = freshTestDir("shmgset-reapid", tag, tmpCtr)
 
 proc bytesOf(s: string): seq[byte] =
   result = newSeq[byte](s.len)
@@ -48,16 +42,30 @@ proc anchorsIn(dir: string): seq[string] =
   for _, p in walkDir(dir):
     if extractFilename(p).endsWith(".shard0"): result.add p
 
-proc runInChild(body: proc () {.closure.}) =
-  ## Run `body` in a forked child that then `_exit`s, so the chain it created is
-  ## owned by a pid that is DEAD by the time the parent reaps. This is the real
-  ## staleness condition, not a simulation of one.
-  let child = fork()
-  if child == 0:
-    body()
-    quitChild(0)
-  var st: cint
-  discard waitpid(child, st, 0)
+# --- child roles (see tests/xproc.nim) --------------------------------------
+
+proc makeAndLeakChain(args: seq[string]) =
+  ## Create a chain, put one element in it, and leave WITHOUT detaching or
+  ## unlinking.
+  let (dir, appId, runId, elem) = (args[0], args[1], args[2], args[3])
+  var cs = createSet(dir, appId, runId, shard0Cap = 32, shard0ArenaCap = 1024)
+  if not cs.available: exitChild(2)
+  if cs.insert(bytesOf(elem)) notin {isInserted, isExists}: exitChild(3)
+  exitChild(0)
+
+registerChildRole("makeAndLeakChain", makeAndLeakChain)
+xprocChildEntry()
+
+proc deadOwnerChain(dir, appId, runId, elem: string) =
+  ## Create a chain in a CHILD PROCESS that then exits, so the chain is owned by
+  ## a pid that is DEAD by the time the parent reaps. This is the real staleness
+  ## condition, not a simulation of one.
+  ##
+  ## It used to be a `fork` plus a closure over the caller's locals. The body is
+  ## now a registered role taking its four inputs as strings, which is what lets
+  ## the same assertion run on a platform without `fork` — see tests/xproc.nim.
+  var c = startChild("makeAndLeakChain", dir, appId, runId, elem)
+  doAssert waitChild(c) == 0, "the dead-owner child failed"
 
 # ---------------------------------------------------------------------------
 # 1. attribution by header
@@ -93,11 +101,7 @@ suite "reaper identity comes from the shard header":
     removeFile(live.path0)                      # this one is not under test
 
     # The chain under test: created by a child, so its owner pid is dead.
-    runInChild(proc () =
-      var cs = createSet(dir, "hdrapp", wantRun, shard0Cap = 32,
-        shard0ArenaCap = 1024)
-      if not cs.available: quitChild(2)
-      discard cs.insert(bytesOf("y")))          # leak on purpose: it must be reaped
+    deadOwnerChain(dir, "hdrapp", wantRun, "y")   # leak on purpose: must be reaped
 
     let found = anchorsIn(dir)
     check found.len == 1
@@ -180,20 +184,12 @@ suite "the appId scope survives the identity change":
     check bSet.insert(bytesOf("b")) == isInserted
 
     # App A: a dead-owner chain (a child creates it and exits).
-    runInChild(proc () =
-      var aSet = createSet(dir, "appA", "runA", shard0Cap = 32,
-        shard0ArenaCap = 1024)
-      if not aSet.available: quitChild(2)
-      discard aSet.insert(bytesOf("a")))
+    deadOwnerChain(dir, "appA", "runA", "a")
 
     # App C: maximally stale — dead owner AND a boot id that is not this boot.
     # A real chain, renamed onto a wrong-boot stem, so the header is genuine.
     var cAnchorRenamed = ""
-    runInChild(proc () =
-      var cSet = createSet(dir, "appC", "runC", shard0Cap = 32,
-        shard0ArenaCap = 1024)
-      if not cSet.available: quitChild(2)
-      discard cSet.insert(bytesOf("c")))
+    deadOwnerChain(dir, "appC", "runC", "c")
     for p in anchorsIn(dir):
       if extractFilename(p).startsWith("appC" & $AppIdSep):
         let dead = shardBasePrefix(dir, "appC", 77'u64, bootId() + 1, 999999'u64)
@@ -250,16 +246,12 @@ suite "staleness still fires on both axes":
     let rebootedOld = rebooted.path0
     rebooted.detach()
     let wrongBootPrefix = shardBasePrefix(dir, "staleapp", 5'u64, bootId() + 1,
-      uint64(getpid()))
+      uint64(ownPid()))
     let rebootedAnchor = wrongBootPrefix & ".shard0"
     moveFile(rebootedOld, rebootedAnchor)
 
     # (b) CURRENT BOOT, DEAD pid: the owner exited.
-    runInChild(proc () =
-      var cs = createSet(dir, "staleapp", "dead-owner-run", shard0Cap = 32,
-        shard0ArenaCap = 1024)
-      if not cs.available: quitChild(2)
-      discard cs.insert(bytesOf("d")))
+    deadOwnerChain(dir, "staleapp", "dead-owner-run", "d")
 
     # (c) CURRENT BOOT, LIVE pid: must be left alone.
     var live = createSet(dir, "staleapp", "live-run", shard0Cap = 32,
@@ -371,8 +363,8 @@ suite "migration from the pre-HM-1 naming":
     let dir = freshDir("legacylive")
     defer: removeDir(dir)
     let prefix = legacyPrefix(dir, "oldapp", "still-running", bootId(),
-      uint64(getpid()))
-    writeLegacyShard(prefix & ".shard0", 0, bootId(), uint64(getpid()), 1)
+      uint64(ownPid()))
+    writeLegacyShard(prefix & ".shard0", 0, bootId(), uint64(ownPid()), 1)
     check reapStaleSegmentsDetailed(dir, "oldapp").len == 0
     check fileExists(prefix & ".shard0")
 
@@ -380,8 +372,8 @@ suite "migration from the pre-HM-1 naming":
     let dir = freshDir("legacyboot")
     defer: removeDir(dir)
     let prefix = legacyPrefix(dir, "oldapp", "prev.boot.run", bootId() + 1,
-      uint64(getpid()))                            # live pid: only boot is stale
-    writeLegacyShard(prefix & ".shard0", 0, bootId() + 1, uint64(getpid()), 1)
+      uint64(ownPid()))                            # live pid: only boot is stale
+    writeLegacyShard(prefix & ".shard0", 0, bootId() + 1, uint64(ownPid()), 1)
     let report = reapStaleSegmentsDetailed(dir, "oldapp")
     check report.len == 1
     check report[0].runId == "prev.boot.run"

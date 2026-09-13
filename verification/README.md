@@ -43,8 +43,22 @@ using the AMBIENT workspace toolchain, end to end — that is what a developer
 edits against all day, and io-mon consumes this repo as a plain source path
 compiled by io-mon's own Nim. The rows below that say "(dev shell)" mean that
 ambient toolchain, not the flake. `nix develop . -c just test` also works and
-gives the same **101 `[OK]` / 0 `[FAILED]` / 0 `[SKIPPED]`** (re-measured
-2026-08-22); it is simply not forced. That count sat stale at 97 for two rounds
+gives the same counts (re-measured 2026-09-14); it is simply not forced. The
+suite now runs NATIVELY ON WINDOWS as well, so the count is per-platform:
+
+| platform | `[OK]` | `[FAILED]` | `[SKIPPED]` | not-applicable |
+|---|---|---|---|---|
+| Linux x86-64 | 114 | 0 | 0 | 0 |
+| Windows x86-64 | 112 | 0 | 0 | 3 |
+
+They reconcile exactly: three cases assert POSIX process semantics with no
+Windows counterpart (a `fork` child holding an inherited `ptr SetPool`, twice,
+and an inherited attached handle, once) and are declared with
+`notApplicableHere`, which deliberately does NOT register them with `unittest`
+so the count DROPS instead of reporting `[OK]` for a case that asserted nothing;
+one case (`shrinking a MAPPED file`) runs on Windows only. 114 = 112 + 3 - 1.
+
+That count sat stale at 97 for two rounds
 while the suite grew to 100 and then 101 — if you change the suite, re-measure
 it here and in the `Justfile` header rather than carrying the old one forward.
 

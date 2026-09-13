@@ -55,20 +55,23 @@
 ##     payload is merely truncated is orphaned (valgrind: 136 bytes definitely
 ##     lost, per pool).
 
-import std/[locks, os, osproc, posix, sets, strutils, unittest]
+import std/[atomics, locks, os, osproc, sets, strutils, unittest]
 import shm_gset
 import shm_gset/transport
+import shm_gset/platform
 import shm_gset/pool
+import ./xproc
 
-proc cExit(code: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
-proc quitChild(code: cint) {.noreturn.} = cExit(code)
+when not defined(windows):
+  # Only for the two cases below that are ABOUT `fork` inheritance and are
+  # declared not-applicable on Windows (`notApplicableHere`). Everything else in
+  # this file goes through `tests/xproc.nim`, which is portable.
+  import std/posix
+  proc cExit(code: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
+  proc quitChild(code: cint) {.noreturn.} = cExit(code)
 
 var tmpCtr = 0
-proc freshDir(tag: string): string =
-  inc tmpCtr
-  result = getTempDir() / ("shmgset-pool-" & tag & "-" & $getpid() & "-" & $tmpCtr)
-  removeDir(result)
-  createDir(result)
+proc freshDir(tag: string): string = freshTestDir("shmgset-pool", tag, tmpCtr)
 
 proc bytesOf(s: string): seq[byte] =
   result = newSeq[byte](s.len)
@@ -94,6 +97,27 @@ proc emitSet(path0: string; tag: string; n: int): bool =
       pr.detach(); return false
   pr.detach()
   true
+
+# --- child roles (see tests/xproc.nim) --------------------------------------
+
+proc deadOwnerPool(args: seq[string]) =
+  ## A CHILD creates its OWN pool, runs several actions through it, recycles, and
+  ## exits WITHOUT closing — so the chain is left on disk owned by a pid that is
+  ## dead by the time the parent reaps.
+  let
+    dir = args[0]
+    rounds = parseInt(args[1])
+    perRound = parseInt(args[2])
+  var cp = newSetPool(dir, "io-mon", shard0Cap = 64, shard0ArenaCap = 2048)
+  for r in 0 ..< rounds:
+    var cl = cp.acquire("child-" & $r)
+    if not cl.available: exitChild(2)
+    if not emitSet(cl.path0, "c" & $r, perRound): exitChild(3)
+    cl.release()
+  exitChild(0)                               # no close: files are left
+
+registerChildRole("deadOwnerPool", deadOwnerPool)
+xprocChildEntry()
 
 proc expectedSet(tag: string; n: int): HashSet[string] =
   result = initHashSet[string]()
@@ -305,6 +329,8 @@ var gMaxConcurrent: int
 var gOracleFailures: int
 var gAcquireFailures: int
 var gChains: HashSet[string]
+var gWorkersDone: Atomic[int]
+var gWorkersMayExit: Atomic[int]
 
 proc worker(a: WorkerArg) {.thread.} =
   {.cast(gcsafe).}:
@@ -335,6 +361,14 @@ proc worker(a: WorkerArg) {.thread.} =
         gInUse.excl anchor
         if not ok: inc gOracleFailures
       l.release()
+    # PARK HERE rather than returning. Every chain this thread created carries
+    # GC'd state allocated on THIS thread's heap, and the main thread is about
+    # to free it in `close`. Nim's default allocator cannot free a block whose
+    # owning thread has exited — see the shutdown-order contract on `SetPool`,
+    # which this is the suite's demonstration of. Nothing about the concurrency
+    # properties below changes; only the order in which the threads end.
+    discard gWorkersDone.fetchAdd(1)
+    while gWorkersMayExit.load(moAcquire) == 0: yieldThread()
 
 suite "the pool under concurrency":
 
@@ -381,11 +415,17 @@ suite "the pool under concurrency":
       perRound = 300
     var p = newSetPool(dir, "io-mon", shard0Cap = 64, shard0ArenaCap = 2048,
       maxIdle = nThreads)
+    gWorkersDone.store(0)
+    gWorkersMayExit.store(0)
     var ths: array[nThreads, Thread[WorkerArg]]
     for i in 0 ..< nThreads:
       createThread(ths[i], worker,
         WorkerArg(p: p, id: i, rounds: rounds, perRound: perRound))
-    joinThreads(ths)
+    # Wait for every worker to FINISH ITS ROUNDS — all leases released, all
+    # assertions below therefore final — but leave them running, so the pool is
+    # closed and destroyed while the threads that allocated its chains are still
+    # alive. See the `SetPool` shutdown-order contract.
+    while gWorkersDone.load(moAcquire) < nThreads: yieldThread()
     check gViolations == 0                      # PRIMARY ASSERTION
     check gOracleFailures == 0                  # PRIMARY ASSERTION
     check gAcquireFailures == 0
@@ -403,6 +443,17 @@ suite "the pool under concurrency":
     check shardFileCount(dir) == 0
     destroySetPool(p)                           # releases the shared object
     check p == nil
+    # The SAME contract applies to this test's own shared bookkeeping, and it is
+    # easy to miss: `gInUse` and `gChains` were filled BY THE WORKERS, so their
+    # buffers and every string in them belong to worker heaps. Releasing them
+    # here — still inside the window where those threads are alive — is the
+    # whole reason the window is held open past `destroySetPool`. Dropping them
+    # at program exit instead crashed in exactly the same place
+    # (`addToSharedFreeList`), after every assertion had already passed.
+    gInUse = initHashSet[string]()
+    gChains = initHashSet[string]()
+    gWorkersMayExit.store(1)                    # ...and only now let them end
+    joinThreads(ths)
     deinitLock(gGuard)
 
 # ---------------------------------------------------------------------------
@@ -438,9 +489,9 @@ suite "a pooled chain is owned by the POOL's process":
     # (a) the NAME still says this process, after twenty recycles.
     let stem = extractFilename(anchor)
     let namePid = stem[0 ..< stem.len - ".shard0".len].rsplit('.', 2)[2]
-    check namePid == $getpid()                   # PRIMARY ASSERTION
+    check namePid == $ownPid()                   # PRIMARY ASSERTION
     # ...and the header field agrees, because the resetter IS the owner.
-    check headerU64(anchor, ShOffConsumerPid) == uint64(getpid())
+    check headerU64(anchor, ShOffConsumerPid) == uint64(ownPid())
     # ...so the reaper leaves the chain alone however often it was recycled.
     check reapStaleSegmentsDetailed(dir, "io-mon").len == 0   # PRIMARY ASSERTION
     check shardFileCount(dir) > 0
@@ -450,19 +501,8 @@ suite "a pooled chain is owned by the POOL's process":
     # actions, recycles, and exits WITHOUT closing.
     let dir2 = freshDir("owner-dead")
     defer: removeDir(dir2)
-    let child = fork()
-    if child == 0:
-      var cp = newSetPool(dir2, "io-mon", shard0Cap = 64, shard0ArenaCap = 2048)
-      for r in 0 ..< 3:
-        var cl = cp.acquire("child-" & $r)
-        if not cl.available: quitChild(2)
-        if not emitSet(cl.path0, "c" & $r, 200): quitChild(3)
-        cl.release()
-      quitChild(0)                               # no close: files are left
-    check child > 0
-    var st: cint
-    check waitpid(child, st, 0) == child
-    check WIFEXITED(st) and WEXITSTATUS(st) == 0
+    var child = startChild("deadOwnerPool", dir2, 3, 200)
+    check waitChild(child) == 0
     check shardFileCount(dir2) > 0
     let reaped = reapStaleSegmentsDetailed(dir2, "io-mon")
     check reaped.len == 1                        # PRIMARY ASSERTION
@@ -471,119 +511,138 @@ suite "a pooled chain is owned by the POOL's process":
     check shardFileCount(dir2) == 0
     check p.close() == 0
 
-  test "a_fork_child_cannot_touch_the_parents_pooled_chain":
-    # The pool is not fork-inheritable, and that is a correctness rule rather
-    # than hygiene. The mapping is MAP_SHARED, so a child that "released" an
-    # inherited lease would `markConsumerGone` on a chain the PARENT is still
-    # serving an action with — and every producer of that action would begin
-    # fast-failing with `emConsumerGone`: unmonitored, and silently. A child
-    # that "acquired" would reset the parent's live chain out from under it.
-    let dir = freshDir("forkpool")
-    defer: removeDir(dir)
-    var p = newSetPool(dir, "io-mon", shard0Cap = 64, shard0ArenaCap = 2048)
-    var l = p.acquire("parent-run")
-    check l.available
-    check emitSet(l.path0, "before", 100)
-    let genBefore = l.generation
-    let path0 = l.path0
+  when defined(windows):
+    notApplicableHere("a_fork_child_cannot_touch_the_parents_pooled_chain",
+      "the rule under test is that a process which INHERITED a `ptr SetPool` " &
+      "across `fork` is refused by acquire, release and close. Windows has no " &
+      "`fork`, so no other process can ever hold this pointer: the guard is " &
+      "UNREACHABLE there, not merely untested. The guard is compiled on Windows " &
+      "and the chain-level damage it prevents is covered there by " &
+      "pool_chain_is_owned_by_the_resetting_process and " &
+      "release_marks_the_consumer_gone_for_a_late_producer.")
+  else:
+    test "a_fork_child_cannot_touch_the_parents_pooled_chain":
+      # The pool is not fork-inheritable, and that is a correctness rule rather
+      # than hygiene. The mapping is MAP_SHARED, so a child that "released" an
+      # inherited lease would `markConsumerGone` on a chain the PARENT is still
+      # serving an action with — and every producer of that action would begin
+      # fast-failing with `emConsumerGone`: unmonitored, and silently. A child
+      # that "acquired" would reset the parent's live chain out from under it.
+      let dir = freshDir("forkpool")
+      defer: removeDir(dir)
+      var p = newSetPool(dir, "io-mon", shard0Cap = 64, shard0ArenaCap = 2048)
+      var l = p.acquire("parent-run")
+      check l.available
+      check emitSet(l.path0, "before", 100)
+      let genBefore = l.generation
+      let path0 = l.path0
 
-    let child = fork()
-    if child == 0:
-      # Exactly what a forked action host would do with an inherited pool.
-      var inherited = p.acquire("child-run")
-      let acquireRefused = (not inherited.available) and
-        inherited.refusal == prForeignProcess
-      l.release()                                 # must be a no-op here
-      let closeRefused = p.close() < 0
-      quitChild(if acquireRefused and closeRefused: cint(0) else: cint(6))
-    check child > 0
-    var st: cint
-    check waitpid(child, st, 0) == child
-    check WIFEXITED(st)
-    check WEXITSTATUS(st) == 0                    # PRIMARY ASSERTION (refusals)
+      let child = fork()
+      if child == 0:
+        # Exactly what a forked action host would do with an inherited pool.
+        var inherited = p.acquire("child-run")
+        let acquireRefused = (not inherited.available) and
+          inherited.refusal == prForeignProcess
+        l.release()                                 # must be a no-op here
+        let closeRefused = p.close() < 0
+        quitChild(if acquireRefused and closeRefused: cint(0) else: cint(6))
+      check child > 0
+      var st: cint
+      check waitpid(child, st, 0) == child
+      check WIFEXITED(st)
+      check WEXITSTATUS(st) == 0                    # PRIMARY ASSERTION (refusals)
 
-    # The parent's action is untouched in every respect that matters.
-    check l.available
-    check l.generation == genBefore               # PRIMARY ASSERTION
-    check l.runId == "parent-run"
-    check headerU64(path0, ShOffConsumerPid) == uint64(getpid())
-    var pr = attachProducer(path0)
-    check pr.available
-    check pr.emit(bytesOf("after/still-monitored")) == emInserted
-                                                  # PRIMARY ASSERTION: the
-                                                  # consumer is still LIVE
-    pr.detach()
-    check unionOfLease(l).len == 101
-    l.release()
-    check p.close() == 0
+      # The parent's action is untouched in every respect that matters.
+      check l.available
+      check l.generation == genBefore               # PRIMARY ASSERTION
+      check l.runId == "parent-run"
+      check headerU64(path0, ShOffConsumerPid) == uint64(ownPid())
+      var pr = attachProducer(path0)
+      check pr.available
+      check pr.emit(bytesOf("after/still-monitored")) == emInserted
+                                                    # PRIMARY ASSERTION: the
+                                                    # consumer is still LIVE
+      pr.detach()
+      check unionOfLease(l).len == 101
+      l.release()
+      check p.close() == 0
 
-  test "a_fork_child_cannot_destroy_the_parents_pool":
-    # `destroySetPool` is the FOURTH ownership-guarded entry point, and for one
-    # round it was the only UNGUARDED one — which made it the most destructive
-    # call in the module, because it is the only one that unlinks
-    # UNCONDITIONALLY. `close` is guarded and `release` is guarded, so nothing
-    # else a child can call touches a file. Measured on the unguarded build,
-    # with the parent MID-ACTION and the child calling `destroySetPool` on the
-    # inherited pool:
-    #
-    #   after child destroySetPool: files=0, parent anchor exists=false
-    #   parent producer attach available=false
-    #
-    # That is strictly WORSE than the fault the ownership rule exists to
-    # prevent. A child's stray `markConsumerGone` leaves the parent's producers
-    # fast-failing with `emConsumerGone` — wrong, but VISIBLE. An unlinked
-    # anchor leaves them unable to `attachProducer` at all: the parent's action
-    # is unmonitored and nothing anywhere says so.
-    #
-    # The sibling test above covers `acquire` / `release` / `close` from a
-    # child. This one exists because `destroySetPool` in a fork child was
-    # COMPLETELY UNTESTED, which is how the regression got in.
-    let dir = freshDir("forkdestroy")
-    defer: removeDir(dir)
-    var p = newSetPool(dir, "io-mon", shard0Cap = 64, shard0ArenaCap = 2048)
-    var l = p.acquire("parent-run")             # the parent is MID-ACTION: the
-    check l.available                           # lease is outstanding, so the
-    let path0 = l.path0                         # chain is in `created` and the
-    check emitSet(path0, "before", 100)         # unguarded sweep would take it
-    let filesBefore = shardFileCount(dir)
-    check filesBefore > 0
+  when defined(windows):
+    notApplicableHere("a_fork_child_cannot_destroy_the_parents_pool",
+      "same reason as the sibling case above: destroySetPool is guarded against " &
+      "a process that inherited the pool pointer across `fork`, and on Windows " &
+      "nothing can inherit it. The UNCONDITIONAL sweep that guard protects is " &
+      "still covered on Windows by " &
+      "close_does_not_unlink_a_chain_whose_lease_is_outstanding and " &
+      "destroySetPool_frees_the_pools_own_buffers.")
+  else:
+    test "a_fork_child_cannot_destroy_the_parents_pool":
+      # `destroySetPool` is the FOURTH ownership-guarded entry point, and for one
+      # round it was the only UNGUARDED one — which made it the most destructive
+      # call in the module, because it is the only one that unlinks
+      # UNCONDITIONALLY. `close` is guarded and `release` is guarded, so nothing
+      # else a child can call touches a file. Measured on the unguarded build,
+      # with the parent MID-ACTION and the child calling `destroySetPool` on the
+      # inherited pool:
+      #
+      #   after child destroySetPool: files=0, parent anchor exists=false
+      #   parent producer attach available=false
+      #
+      # That is strictly WORSE than the fault the ownership rule exists to
+      # prevent. A child's stray `markConsumerGone` leaves the parent's producers
+      # fast-failing with `emConsumerGone` — wrong, but VISIBLE. An unlinked
+      # anchor leaves them unable to `attachProducer` at all: the parent's action
+      # is unmonitored and nothing anywhere says so.
+      #
+      # The sibling test above covers `acquire` / `release` / `close` from a
+      # child. This one exists because `destroySetPool` in a fork child was
+      # COMPLETELY UNTESTED, which is how the regression got in.
+      let dir = freshDir("forkdestroy")
+      defer: removeDir(dir)
+      var p = newSetPool(dir, "io-mon", shard0Cap = 64, shard0ArenaCap = 2048)
+      var l = p.acquire("parent-run")             # the parent is MID-ACTION: the
+      check l.available                           # lease is outstanding, so the
+      let path0 = l.path0                         # chain is in `created` and the
+      check emitSet(path0, "before", 100)         # unguarded sweep would take it
+      let filesBefore = shardFileCount(dir)
+      check filesBefore > 0
 
-    let child = fork()
-    if child == 0:
+      let child = fork()
+      if child == 0:
+        destroySetPool(p)
+        # THE REFUSAL CHANNEL. A destroy in the OWNING process nils `p`, so `p`
+        # still being non-nil after the call is exactly "this process was
+        # refused" — the fourth distinct channel, after `acquire`'s
+        # `prForeignProcess`, `close`'s `-1`, and `release`'s silence.
+        quitChild(if p == nil: cint(7) else: cint(0))
+      check child > 0
+      var st: cint
+      check waitpid(child, st, 0) == child
+      check WIFEXITED(st)
+      check WEXITSTATUS(st) == 0                  # PRIMARY ASSERTION: `p` stayed
+                                                  # non-nil in the child
+
+      # The parent's live action survives, in the way that actually matters.
+      check fileExists(path0)                     # PRIMARY ASSERTION
+      check shardFileCount(dir) == filesBefore    # PRIMARY ASSERTION: no sweep
+      var pr = attachProducer(path0)
+      check pr.available                          # PRIMARY ASSERTION: the parent's
+                                                  # action is still MONITORABLE at
+                                                  # all — this is the one the
+                                                  # unguarded build silently loses
+      check pr.emit(bytesOf("after/still-monitored")) == emInserted
+      pr.detach()
+      check l.available
+      check l.runId == "parent-run"
+      check unionOfLease(l).len == 101
+      l.release()
+
+      # CONTROL, so this cannot be satisfied by a `destroySetPool` that does
+      # nothing for ANYONE: in the OWNING process it must still nil `p` and still
+      # take the files with it.
       destroySetPool(p)
-      # THE REFUSAL CHANNEL. A destroy in the OWNING process nils `p`, so `p`
-      # still being non-nil after the call is exactly "this process was
-      # refused" — the fourth distinct channel, after `acquire`'s
-      # `prForeignProcess`, `close`'s `-1`, and `release`'s silence.
-      quitChild(if p == nil: cint(7) else: cint(0))
-    check child > 0
-    var st: cint
-    check waitpid(child, st, 0) == child
-    check WIFEXITED(st)
-    check WEXITSTATUS(st) == 0                  # PRIMARY ASSERTION: `p` stayed
-                                                # non-nil in the child
-
-    # The parent's live action survives, in the way that actually matters.
-    check fileExists(path0)                     # PRIMARY ASSERTION
-    check shardFileCount(dir) == filesBefore    # PRIMARY ASSERTION: no sweep
-    var pr = attachProducer(path0)
-    check pr.available                          # PRIMARY ASSERTION: the parent's
-                                                # action is still MONITORABLE at
-                                                # all — this is the one the
-                                                # unguarded build silently loses
-    check pr.emit(bytesOf("after/still-monitored")) == emInserted
-    pr.detach()
-    check l.available
-    check l.runId == "parent-run"
-    check unionOfLease(l).len == 101
-    l.release()
-
-    # CONTROL, so this cannot be satisfied by a `destroySetPool` that does
-    # nothing for ANYONE: in the OWNING process it must still nil `p` and still
-    # take the files with it.
-    destroySetPool(p)
-    check p == nil                              # PRIMARY ASSERTION (control)
-    check shardFileCount(dir) == 0              # PRIMARY ASSERTION (control)
+      check p == nil                              # PRIMARY ASSERTION (control)
+      check shardFileCount(dir) == 0              # PRIMARY ASSERTION (control)
 
 # ---------------------------------------------------------------------------
 # 5. the refusal policies — retry vs retire, per `ResetStatus`
@@ -922,3 +981,5 @@ suite "the pool's own shutdown":
         " pool lifecycles: ", growth, " bytes"
       check growth < maxGrowthBytes               # PRIMARY ASSERTION
       check shardFileCount(dir) == 0              # ...and nothing on disk either
+
+reportNotApplicable()

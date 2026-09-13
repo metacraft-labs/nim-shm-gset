@@ -7,17 +7,12 @@
 ## fork/probe-storm through `emit` yields the exact union (LF-1). Every check
 ## asserts.
 
-import std/[os, posix, sets, strutils, unittest]
+import std/[os, sets, strutils, unittest]
 import shm_gset/transport
-
-proc cExit(code: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
-proc quitChild(code: cint) {.noreturn.} = cExit(code)
+import ./xproc
 
 var tmpCtr = 0
-proc freshDir(tag: string): string =
-  inc tmpCtr
-  result = getTempDir() / ("shmgset-xport-" & tag & "-" & $getpid() & "-" & $tmpCtr)
-  removeDir(result); createDir(result)
+proc freshDir(tag: string): string = freshTestDir("shmgset-xport", tag, tmpCtr)
 
 proc bytesOf(s: string): seq[byte] =
   result = newSeq[byte](s.len)
@@ -26,6 +21,32 @@ proc bytesOf(s: string): seq[byte] =
 proc strOf(b: seq[byte]): string =
   result = newString(b.len)
   for i in 0 ..< b.len: result[i] = char(b[i])
+
+# --- child roles (see tests/xproc.nim) --------------------------------------
+
+proc stormProducer(args: seq[string]) =
+  ## One producer of the LF-1 probe storm: attach to `path0`, emit `perProc`
+  ## distinct elements `dupFactor` times each, detach. Everything it needs is in
+  ## `args`, so the same body is a forked child on POSIX and a spawned one on
+  ## Windows.
+  let
+    path0 = args[0]
+    c = parseInt(args[1])
+    perProc = parseInt(args[2])
+    dupFactor = parseInt(args[3])
+  var pr = attachProducer(path0)
+  if not pr.available: exitChild(2)
+  for j in 0 ..< perProc:
+    let e = bytesOf("c" & $c & "/dep-" & $j)
+    for _ in 0 ..< dupFactor:
+      case pr.emit(e)
+      of emInserted, emExists: discard
+      else: (pr.detach(); exitChild(3))
+  pr.detach()
+  exitChild(0)
+
+registerChildRole("stormProducer", stormProducer)
+xprocChildEntry()
 
 suite "transport interface (design spec §5)":
   test "host lifecycle + producer emit status mapping":
@@ -95,26 +116,11 @@ suite "transport interface (design spec §5)":
     check host.available
     let path0 = host.path0
 
-    var pids: seq[Pid]
+    var kids: seq[Child]
     for c in 0 ..< nProc:
-      let pid = fork()
-      if pid == 0:
-        var pr = attachProducer(path0)
-        if not pr.available: quitChild(2)
-        for j in 0 ..< perProc:
-          let e = bytesOf("c" & $c & "/dep-" & $j)
-          for _ in 0 ..< dupFactor:
-            case pr.emit(e)
-            of emInserted, emExists: discard
-            else: (pr.detach(); quitChild(3))
-        pr.detach(); quitChild(0)
-      else:
-        check pid > 0
-        pids.add(pid)
-    for pid in pids:
-      var st: cint
-      check waitpid(pid, st, 0) == pid
-      check WIFEXITED(st) and WEXITSTATUS(st) == 0
+      kids.add startChild("stormProducer", path0, c, perProc, dupFactor)
+    for k in kids.mitems:
+      check waitChild(k) == 0
 
     var expected = initHashSet[string]()
     for c in 0 ..< nProc:

@@ -44,7 +44,7 @@
 ## revision forward and in both directions between any two revisions that have
 ## them.
 
-import std/[os, osproc, posix, streams, strutils, unittest]
+import std/[os, osproc, streams, strutils, unittest]
 import shm_gset
 import shm_gset/transport
 import ac_index_model
@@ -52,7 +52,7 @@ import ac_index_model
 var tmpCtr = 0
 proc freshDir(tag: string): string =
   inc tmpCtr
-  result = getTempDir() / ("shmgset-skew-" & tag & "-" & $getpid() & "-" & $tmpCtr)
+  result = getTempDir() / ("shmgset-skew-" & tag & "-" & $getCurrentProcessId() & "-" & $tmpCtr)
   removeDir(result)
   createDir(result)
 
@@ -60,21 +60,49 @@ proc bytesOf(s: string): seq[byte] =
   result = newSeq[byte](s.len)
   for i, c in s: result[i] = byte(c)
 
+const ExeExt2 = when defined(windows): ".exe" else: ""
+
 proc v2ProducerBin(): string =
   ## The skewed peer, built by the test runner (Justfile `test` / nimble `test`).
   ## A MISSING binary is a hard failure, never a skip: a skew test that quietly
   ## does not run is the same invisibility this suite exists to remove.
   result = getEnv("SHM_GSET_V2_PRODUCER", "tests/helpers/v2_producer")
+  # Both runners spell the output `-o:tests/helpers/v2_producer`; Nim appends the
+  # platform executable extension itself, so on Windows the binary that line
+  # produces is `v2_producer.exe`. Resolve that here rather than making the two
+  # runner definitions platform-dependent — they are held byte-identical to each
+  # other by scripts/check-runner-parity.sh, and a `when defined(windows)` in
+  # both would be one more thing for that gate to have to understand.
+  if not fileExists(result) and fileExists(result & ExeExt2): result = result & ExeExt2
   doAssert fileExists(result),
     "the rev-2 peer binary is missing at '" & result &
     "'; build it with `nim c -o:tests/helpers/v2_producer " &
     "tests/helpers/v2_producer.nim` (both test runners do this)"
+  # ABSOLUTE. `startProcess(.., poUsePath)` resolves a RELATIVE program name
+  # against PATH on Windows rather than against the working directory, so the
+  # relative path this returns by default is found by `fileExists` and then not
+  # found by `CreateProcess`. Absolutising it here is the whole fix and costs
+  # nothing on POSIX.
+  result = absolutePath(result)
 
 
 proc runV2Status(args: seq[string]): tuple[output: string; code: int] =
   let p = startProcess(v2ProducerBin(), args = args,
     options = {poStdErrToStdOut, poUsePath})
-  let outp = p.outputStream.readAll()
+  # DRAIN LINE BY LINE, not `readAll`. `streams.readAll` stops as soon as one
+  # read returns fewer bytes than it asked for, which for a PIPE means "nothing
+  # more has been written YET", not "end of file". Against a child that is still
+  # starting up it therefore returns a prefix of the output and the test asserts
+  # a substring against it: measured on Windows, the captured output of the
+  # skewed peer was the single byte `v` out of a 74-byte diagnostic, so the
+  # `"layout skew" in outp` check failed while the peer had behaved perfectly.
+  # `readLine` blocks for a terminator or a real EOF, so the whole diagnostic
+  # arrives on every platform.
+  var outp = ""
+  var line = ""
+  while p.outputStream.readLine(line):
+    outp.add line
+    outp.add '\n'
   let code = p.waitForExit()
   p.close()
   (outp, code)
@@ -200,7 +228,7 @@ suite "a header-layout skew is diagnosable":
     let dir = freshDir("v1")
     defer: removeDir(dir)
     let path0 = dir / ("oldapp" & $AppIdSep & "1.1.1.shard0")
-    writeLegacyV1Shard(path0, bootId(), uint64(getpid()))
+    writeLegacyV1Shard(path0, bootId(), uint64(getCurrentProcessId()))
     var s = attachSet(path0)
     check (not s.available)
     check s.attachFailure == afLayoutSkew       # PRIMARY ASSERTION

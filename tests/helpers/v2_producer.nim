@@ -29,7 +29,8 @@
 ## from `shm_gset`'s `ShOff*` — precisely because those have moved and will move
 ## again. This file must keep describing rev 2 however the current layout evolves.
 
-import std/[os, posix, strutils]
+import std/[os, strutils]
+import shm_gset/platform
 
 const
   V2Magic = 0x5347_4D48_53_00_02'u64   # "SHM SG", layout revision 2
@@ -67,17 +68,12 @@ func fnv(blob: openArray[byte]): uint64 =
     result = (result xor uint64(b)) * 1099511628211'u64
 
 proc bootId(): uint64 =
-  ## Byte-for-byte the same derivation rev 2 used, so the boot guard passes for
-  ## a chain written by either side.
-  try:
-    let raw = readFile("/proc/sys/kernel/random/boot_id")
-    var h: uint64 = 1469598103934665603'u64
-    for ch in raw:
-      if ch != '-' and ch != '\n':
-        h = (h xor uint64(ord(ch))) * 1099511628211'u64
-    return (h or 1'u64)
-  except CatchableError: discard
-  1'u64
+  ## The boot identity rev 2 used. It is taken from `shm_gset/platform` rather
+  ## than re-derived here — unlike the layout offsets above, which are literals
+  ## on purpose, this is not a layout fact but an ENVIRONMENT fact that must
+  ## AGREE with whatever build is on the other side of the skew, on whichever OS
+  ## the test runs. On Linux the derivation is byte-for-byte the one rev 2 used.
+  platformBootId()
 
 type Base = ptr UncheckedArray[byte]
 
@@ -93,16 +89,16 @@ proc putU32(b: Base; off: int; v: uint32) =
   copyMem(addr b[off], addr x, 4)
 
 proc mapFile(path: string; size: var int): Base =
-  let fd = open(path.cstring, O_RDWR)
-  if fd < 0: return nil
+  let fd = openReadWrite(path)
+  if not fd.isValid: return nil
   try: size = int(getFileSize(path))
   except CatchableError:
-    discard close(fd); return nil
+    closeFile(fd); return nil
   if size <= V2HeaderSize:
-    discard close(fd); return nil
-  let p = mmap(nil, size, PROT_READ or PROT_WRITE, MAP_SHARED, fd, 0)
-  discard close(fd)
-  if p == MAP_FAILED: return nil
+    closeFile(fd); return nil
+  let p = mapShared(fd, size)
+  closeFile(fd)
+  if p == nil: return nil
   cast[Base](p)
 
 proc writeChain(path0, runId: string; cap, arenaCap: int) =
@@ -127,20 +123,20 @@ proc writeChain(path0, runId: string; cap, arenaCap: int) =
   putU64(b, OffOccupied, 0)
   putU64(b, OffChainCount, 1)
   putU64(b, OffGrowthFailed, 0)
-  putU64(b, OffConsumerPid, uint64(getpid()))
+  putU64(b, OffConsumerPid, currentPid())
   putU64(b, OffConsumerBoot, boot)
   putU64(b, OffConsumerAlive, 1)
   let rn = min(runId.len, RunIdMax)
   if rn > 0: copyMem(addr b[OffRunId], unsafeAddr runId[0], rn)
   putU32(b, OffRunIdLen, uint32(rn))
   putU64(b, OffMagic, V2Magic)           # magic LAST, as rev 2 did
-  discard munmap(cast[pointer](b), sz)
+  unmapShared(cast[pointer](b), sz)
 
 proc produce(path0, elem: string): int =
   var size = 0
   let b = mapFile(path0, size)
   if b == nil: return 11
-  defer: discard munmap(cast[pointer](b), size)
+  defer: unmapShared(cast[pointer](b), size)
   let magic = getU64(b, OffMagic)
   if magic != V2Magic:
     # THE SKEW: a genuine layout disagreement. rev 2 had no way to say so —

@@ -11,22 +11,15 @@
 ##   §4.5(d) real multi-process (fork) SIGKILL fault injection at every publish
 ##           point; the single-threaded reader's union stays correct.
 
-import std/[os, posix, sets, strutils, tables, times, unittest, atomics]
+import std/[os, sets, strutils, tables, times, unittest, atomics]
 import shm_gset
+import shm_gset/platform
+import ./xproc
 
 static: doAssert scheduleHooksEnabled, "expected -d:shmGSetScheduleHooks"
 
-proc cExit(code: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
-proc quitChild(code: cint) {.noreturn.} = cExit(code)
-proc flock(fd: cint; op: cint): cint {.importc, header: "<sys/file.h>".}
-const LOCK_EX = cint(2)
-const LOCK_UN = cint(8)
-
 var tmpCtr = 0
-proc freshDir(tag: string): string =
-  inc tmpCtr
-  result = getTempDir() / ("shmgset-cc-" & tag & "-" & $getpid() & "-" & $tmpCtr)
-  removeDir(result); createDir(result)
+proc freshDir(tag: string): string = freshTestDir("shmgset-cc", tag, tmpCtr)
 
 proc bytesOf(s: string): seq[byte] =
   result = newSeq[byte](s.len)
@@ -58,7 +51,7 @@ proc pauseHook(p: SchedulePoint) {.gcsafe, raises: [].} =
     tPaused = true
     discard gArrived.fetchAdd(1)
     while gRelease.load(moAcquire) == 0:
-      discard sched_yield()
+      yieldThread()
 
 proc workerThread(id: int) {.thread.} =
   {.cast(gcsafe).}:
@@ -75,7 +68,7 @@ proc waitArrived(target: int; sec: float): bool =
   let dl = epochTime() + sec
   while gArrived.load(moAcquire) < target:
     if epochTime() > dl: return false
-    discard sched_yield()
+    yieldThread()
   true
 
 proc resetBarrier() =
@@ -102,8 +95,14 @@ suite "position-independence via MAP_FIXED (design spec §4.5(b))":
     # choosing that differs from the owner's mapping. Offsets-only ⇒ identical
     # results; any leaked absolute pointer would fault or mismatch here.
     let sz = int(getFileSize(owner.path0))
-    let want = mmap(nil, sz, PROT_NONE, MAP_PRIVATE or MAP_ANONYMOUS, cint(-1), 0)
-    check want != MAP_FAILED
+    let want = reserveMapBase(sz)
+    check want != nil
+    # The chosen base must satisfy THIS platform's mapping alignment — 4 KiB on
+    # POSIX, 64 KiB on Win32, where a merely page-aligned base is rejected
+    # outright. Asserting it here means a future change to `reserveMapBase` that
+    # returned an illegal address would fail as an alignment error rather than as
+    # a mysterious "attach unavailable".
+    check cast[uint](want) mod uint(shmGSetMapBaseAlignment) == 0
     setForcedNextMapBase(want)
     var view = attachSet(owner.path0)
     check view.available
@@ -262,38 +261,102 @@ suite "reaper vs starting/active run (design spec §4.5(c))":
     # Forge a would-be-stale anchor (wrong boot-id ⇒ reapable) but hold its flock,
     # as a run that is just starting / actively owning shard0 would.
     let wrongBoot = bootId() + 1
-    let livePid = uint64(getpid())
+    let livePid = uint64(ownPid())
     let stalePrefix = shardBasePrefix(dir, "io-mon", 1'u64, wrongBoot, livePid)
     let staleAnchor = stalePrefix & ".shard0"
     writeFile(staleAnchor, "starting-run shard0")
     check fileExists(staleAnchor)
 
-    let fd = open(staleAnchor.cstring, O_RDWR)
-    check fd >= 0
-    check flock(fd, LOCK_EX) == 0        # the owner holds the lock
+    # The lock is taken through the SAME primitive the reaper uses, so the test
+    # exercises the shipped exclusion rather than a lookalike: `flock` on POSIX,
+    # `LockFileEx` on Win32.
+    let fd = openReadWrite(staleAnchor)
+    check fd.isValid
+    check tryLockExclusive(fd)           # the owner holds the lock
 
-    # Reaper runs concurrently: the flock guard MUST protect the run.
+    # Reaper runs concurrently: the lock guard MUST protect the run.
     check reapStaleSegments(dir, "io-mon") == 0
     check fileExists(staleAnchor)
 
     # Once the owner releases the lock, the stale run becomes reapable.
-    check flock(fd, LOCK_UN) == 0
-    discard close(fd)
+    check unlockExclusive(fd)
+    closeFile(fd)
     check reapStaleSegments(dir, "io-mon") >= 1
     check (not fileExists(staleAnchor))
 
 # --- (d) real multi-process SIGKILL fault injection -------------------------
 
 var gTargetPoint: SchedulePoint
-var gKillPipeW: cint
 var tReached {.threadvar.}: bool
 
+# The "I am at the publish point" announcement is a FILE, not a pipe: a FORKED
+# child inherits a pipe descriptor and a SPAWNED child does not, whereas a file
+# in the test's own directory works identically for both.
+#
+# The path is a fixed char buffer and the file is created through C `fopen`
+# rather than `writeFile`, because the hook is `{.gcsafe, raises: [].}` — it runs
+# inside the library's publish path — and a GC'd global string is neither. This
+# is the one place in the suite where that matters.
+var gReachedPath: array[1024, char]
+
+proc cFopen(path, mode: cstring): pointer {.importc: "fopen",
+  header: "<stdio.h>".}
+proc cFclose(f: pointer): cint {.importc: "fclose", header: "<stdio.h>".}
+
+proc setReachedPath(path: string) =
+  doAssert path.len < gReachedPath.len
+  zeroMem(addr gReachedPath[0], gReachedPath.len)
+  if path.len > 0: copyMem(addr gReachedPath[0], unsafeAddr path[0], path.len)
+
 proc killHook(p: SchedulePoint) {.gcsafe, raises: [].} =
+  ## Announce "I am AT the publish point", then spin here forever waiting to be
+  ## destroyed. The marker is written BEFORE the spin, so the parent cannot
+  ## observe it until the victim is genuinely parked at the point.
   if p == gTargetPoint and not tReached:
     tReached = true
-    var one: byte = 1
-    discard write(gKillPipeW, addr one, 1)   # tell the parent "I am AT the point"
-    while true: discard sched_yield()          # wait to be SIGKILLed here
+    let f = cFopen(cast[cstring](addr gReachedPath[0]), "wb".cstring)
+    if f != nil: discard cFclose(f)
+    while true: yieldThread()            # wait to be killed HERE
+
+proc committedProducer(args: seq[string]) =
+  ## A producer that commits its whole intended subset and exits cleanly, so the
+  ## oracle has elements that MUST survive the victim's crash.
+  let
+    path0 = args[0]
+    c = parseInt(args[1])
+    perCommit = parseInt(args[2])
+  var s = attachSet(path0)
+  if not s.available: exitChild(2)
+  for j in 0 ..< perCommit:
+    if s.insert(bytesOf("commit" & $c & "/" & $j)) == isUnavailable:
+      exitChild(3)
+  s.detach()
+  exitChild(0)
+
+proc killVictim(args: seq[string]) =
+  ## Insert until the chosen schedule point fires, then park there to be killed.
+  ## Reaching the end means the point never fired, and the `finished` marker it
+  ## writes is what makes that visible to the parent instead of silent.
+  let
+    path0 = args[0]
+    victimCount = parseInt(args[1])
+    point = SchedulePoint(parseInt(args[2]))
+    finishedFile = args[4]
+  setReachedPath(args[3])
+  gTargetPoint = point
+  var s = attachSet(path0)
+  if not s.available: exitChild(2)
+  setScheduleHook(killHook)
+  for j in 0 ..< victimCount:
+    discard s.insert(bytesOf("victim/" & $j))
+  s.detach()
+  try: writeFile(finishedFile, "ran-to-completion")
+  except CatchableError: discard
+  exitChild(0)
+
+registerChildRole("committedProducer", committedProducer)
+registerChildRole("killVictim", killVictim)
+xprocChildEntry()
 
 proc faultInjectAt(point: SchedulePoint; victimCount: int; label: string) =
   let dir = freshDir("kill-" & label)
@@ -310,51 +373,38 @@ proc faultInjectAt(point: SchedulePoint; victimCount: int; label: string) =
   for c in 0 ..< nCommit:
     for j in 0 ..< perCommit: committed.incl("commit" & $c & "/" & $j)
 
-  var cpids: seq[Pid]
+  var kids: seq[Child]
   for c in 0 ..< nCommit:
-    let pid = fork()
-    if pid == 0:
-      var s = attachSet(path0)
-      if not s.available: quitChild(2)
-      for j in 0 ..< perCommit:
-        if s.insert(bytesOf("commit" & $c & "/" & $j)) == isUnavailable:
-          quitChild(3)
-      s.detach(); quitChild(0)
-    else:
-      doAssert pid > 0
-      cpids.add pid
-  for pid in cpids:
-    var st: cint
-    doAssert waitpid(pid, st, 0) == pid
-    doAssert WIFEXITED(st) and WEXITSTATUS(st) == 0, label & ": committed producer failed"
+    kids.add startChild("committedProducer", path0, c, perCommit)
+  for k in kids.mitems:
+    doAssert waitChild(k) == 0, label & ": committed producer failed"
 
-  # Victim: pause at `point`, tell parent, get SIGKILLed there.
-  var fds: array[0..1, cint]
-  doAssert pipe(fds) == 0
-  gTargetPoint = point
-  let victim = fork()
-  if victim == 0:
-    discard close(fds[0])
-    gKillPipeW = fds[1]
-    var s = attachSet(path0)
-    if not s.available: quitChild(2)
-    setScheduleHook(killHook)
-    for j in 0 ..< victimCount:
-      discard s.insert(bytesOf("victim/" & $j))
-    s.detach(); quitChild(0)             # (reached only if the point never fired)
-  doAssert victim > 0
-  discard close(fds[1])
+  # Victim: park at `point`, tell the parent, and be destroyed THERE.
+  let reachedFile = dir / "victim-reached"
+  let finishedFile = dir / "victim-finished"
+  var victim = startChild("killVictim", path0, victimCount, $int(point),
+    reachedFile, finishedFile)
 
   # Wait (bounded, no hang) for the victim to reach the publish point.
-  var one: byte
-  let n = read(fds[0], addr one, 1)
-  doAssert n == 1, label & ": victim never reached " & $point &
-    " (read returned " & $n & ")"
-  doAssert kill(victim, SIGKILL) == 0
-  var st: cint
-  doAssert waitpid(victim, st, 0) == victim
-  doAssert WIFSIGNALED(st), label & ": victim was not killed at the point"
-  discard close(fds[0])
+  let deadline = epochTime() + 30.0
+  while not fileExists(reachedFile):
+    doAssert epochTime() < deadline,
+      label & ": victim never reached " & $point
+    yieldThread()
+  killChild(victim)
+  let vst = waitChild(victim)
+
+  # THE EVIDENCE THAT THE KILL LANDED WHERE IT WAS AIMED, stated as two
+  # properties rather than as a wait-status encoding: the victim DID reach the
+  # publish point (the marker exists) and it did NOT run past it (the marker its
+  # normal path writes does not). That is platform-independent, and it is
+  # strictly more specific than "the wait status says signalled" — which on its
+  # own cannot tell a kill at the point from a kill anywhere else.
+  doAssert fileExists(reachedFile), label & ": victim never reached the point"
+  doAssert not fileExists(finishedFile),
+    label & ": victim ran PAST " & $point & " instead of being killed at it"
+  doAssert vst == KilledExitStatus,
+    label & ": victim exited " & $vst & " rather than being killed"
 
   # The single-threaded reader's union must be correct:
   var got = initHashSet[string]()

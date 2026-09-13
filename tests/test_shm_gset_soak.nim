@@ -17,13 +17,11 @@
 ## cross-attribute, with real forked producers rather than in-process inserts.
 ## Round count via `SHM_GSET_RECYCLE_ROUNDS` (default 20).
 
-import std/[os, posix, sets, strutils, times]
+import std/[os, sets, strutils, times]
 import shm_gset
 import shm_gset/transport
 import shm_gset/pool
-
-proc cExit(code: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
-proc quitChild(code: cint) {.noreturn.} = cExit(code)
+import ./xproc
 
 proc bytesOf(s: string): seq[byte] =
   result = newSeq[byte](s.len)
@@ -33,13 +31,55 @@ proc strOf(b: seq[byte]): string =
   result = newString(b.len)
   for i in 0 ..< b.len: result[i] = char(b[i])
 
+# --- child roles (see tests/xproc.nim) --------------------------------------
+
+proc soakProducer(args: seq[string]) =
+  ## Phase-1 producer: re-insert this producer's whole intended subset in a loop
+  ## until the deadline (the probe-storm shape), against TINY shards so growth
+  ## runs constantly underneath.
+  let
+    path0 = args[0]
+    c = parseInt(args[1])
+    perProc = parseInt(args[2])
+    soakSecs = parseFloat(args[3])
+  var s = attachSet(path0)
+  if not s.available: exitChild(2)
+  let deadline = epochTime() + soakSecs
+  while epochTime() < deadline:
+    for j in 0 ..< perProc:
+      case s.insert(bytesOf("c" & $c & "/" & $j))
+      of isInserted, isExists: discard
+      else: (s.detach(); exitChild(3))
+  s.detach()
+  exitChild(0)
+
+proc recycleProducer(args: seq[string]) =
+  ## Phase-2 producer: emit one generation's disjoint input set through the
+  ## transport into a chain the POOL handed out.
+  let
+    p0 = args[0]
+    tag = args[1]
+    c = parseInt(args[2])
+    rcPer = parseInt(args[3])
+  var pr = attachProducer(p0)
+  if not pr.available: exitChild(2)
+  for j in 0 ..< rcPer:
+    if pr.emit(bytesOf(tag & "/c" & $c & "/" & $j)) notin {emInserted, emExists}:
+      pr.detach(); exitChild(3)
+  pr.detach()
+  exitChild(0)
+
+registerChildRole("soakProducer", soakProducer)
+registerChildRole("recycleProducer", recycleProducer)
+xprocChildEntry()
+
 when isMainModule:
   let soakSecs = try: parseFloat(getEnv("SHM_GSET_SOAK_SECONDS", "2.0"))
                  except ValueError: 2.0
   const
     nProc = 6
     perProc = 1200        ## distinct per producer
-  let dir = getTempDir() / ("shmgset-soak-" & $getpid())
+  let dir = getTempDir() / ("shmgset-soak-" & $ownPid())
   removeDir(dir); createDir(dir)
   # Tiny shards ⇒ maximal sharding / constant concurrent growth (§4.5(d)).
   var host = createSet(dir, "io-mon", "edge", shard0Cap = 16, shard0ArenaCap = 512)
@@ -49,28 +89,11 @@ when isMainModule:
   echo "soak: ", nProc, " producers x ", perProc, " distinct, ",
     soakSecs, "s, tiny shards"
 
-  var pids: seq[Pid]
+  var kids: seq[Child]
   for c in 0 ..< nProc:
-    let pid = fork()
-    if pid == 0:
-      var s = attachSet(path0)
-      if not s.available: quitChild(2)
-      let deadline = epochTime() + soakSecs
-      # Re-insert the whole intended subset repeatedly (probe-storm shape) until
-      # the deadline; every insert must be accepted or a known duplicate.
-      while epochTime() < deadline:
-        for j in 0 ..< perProc:
-          case s.insert(bytesOf("c" & $c & "/" & $j))
-          of isInserted, isExists: discard
-          else: (s.detach(); quitChild(3))
-      s.detach(); quitChild(0)
-    else:
-      doAssert pid > 0
-      pids.add pid
-  for pid in pids:
-    var st: cint
-    doAssert waitpid(pid, st, 0) == pid
-    doAssert WIFEXITED(st) and WEXITSTATUS(st) == 0, "a soak producer failed"
+    kids.add startChild("soakProducer", path0, c, perProc, soakSecs)
+  for k in kids.mitems:
+    doAssert waitChild(k) == 0, "a soak producer failed"
 
   var expected = initHashSet[string]()
   for c in 0 ..< nProc:
@@ -98,7 +121,7 @@ when isMainModule:
   const
     rcProc = 4
     rcPer = 500
-  let rcDir = getTempDir() / ("shmgset-recycle-soak-" & $getpid())
+  let rcDir = getTempDir() / ("shmgset-recycle-soak-" & $ownPid())
   removeDir(rcDir); createDir(rcDir)
   var gsetPool = newSetPool(rcDir, "io-mon", shard0Cap = 16, shard0ArenaCap = 512,
     maxIdle = 2)
@@ -118,24 +141,11 @@ when isMainModule:
     doAssert lease.runId == "gen-" & $round
 
     let tag = "g" & $round
-    var kids: seq[Pid]
+    var kids: seq[Child]
     for c in 0 ..< rcProc:
-      let pid = fork()
-      if pid == 0:
-        var pr = attachProducer(p0)
-        if not pr.available: quitChild(2)
-        for j in 0 ..< rcPer:
-          if pr.emit(bytesOf(tag & "/c" & $c & "/" & $j)) notin
-              {emInserted, emExists}:
-            pr.detach(); quitChild(3)
-        pr.detach(); quitChild(0)
-      else:
-        doAssert pid > 0
-        kids.add pid
-    for pid in kids:
-      var st: cint
-      doAssert waitpid(pid, st, 0) == pid
-      doAssert WIFEXITED(st) and WEXITSTATUS(st) == 0,
+      kids.add startChild("recycleProducer", p0, tag, c, rcPer)
+    for k in kids.mitems:
+      doAssert waitChild(k) == 0,
         "a recycle-soak producer failed in round " & $round
 
     var want = initHashSet[string]()

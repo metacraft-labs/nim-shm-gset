@@ -30,7 +30,15 @@ task test, "Build + run the nim-shm-gset test suite":
   # forbids it; nothing checked it. Now something does.
   exec "bash scripts/check-runner-parity.sh"
 
-  # Functional + concurrency (multi-process fork) suite for the sharded G-Set.
+  # The OS contract the port rests on, asserted on whichever platform this is
+  # running on rather than assumed from documentation: a mapped view outliving
+  # its descriptor, a view staying coherent after the name is unlinked (with a
+  # descriptor still open — the reaper's own sequence, and the case that makes
+  # the Win32 share mode load-bearing), exclusive publish, the whole-file lock
+  # excluding another process, `processAlive`, and a boot identity that is the
+  # same in a second process a second later.
+  exec "nim c -r " & testFlags & " tests/test_shm_gset_platform.nim"
+  # Functional + concurrency (multi-process) suite for the sharded G-Set.
   exec "nim c -r " & testFlags & " tests/test_shm_gset.nim"
   # Transport layer: the LF-1 gate (a multi-process probe storm through `emit`
   # unions EXACTLY) and the LF-2 fail-fast gates (`emUnavailable` when the set

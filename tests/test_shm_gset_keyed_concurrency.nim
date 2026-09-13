@@ -11,24 +11,109 @@
 ## the elements by completely different routes (one follows the probe run, the
 ## other scans every slot of every shard) and must still agree exactly.
 
-import std/[os, posix, sets, strutils, tables, unittest]
+import std/[os, sets, strutils, tables, unittest]
 import shm_gset
 import ac_index_model
-
-proc cExit(code: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
-proc quitChild(code: cint) {.noreturn.} = cExit(code)
+import ./xproc
 
 var tmpCtr = 0
-proc freshDir(tag: string): string =
-  inc tmpCtr
-  result = getTempDir() / ("shmgset-kc-" & tag & "-" & $getpid() & "-" & $tmpCtr)
-  removeDir(result); createDir(result)
+proc freshDir(tag: string): string = freshTestDir("shmgset-kc", tag, tmpCtr)
 
 proc hexOf(b: openArray[byte]): string =
   result = newStringOfCap(b.len * 2)
   for x in b: result.add toHex(x.int, 2)
 
 proc hexOf(b: Fp32): string = hexOf(b.toOpenArray(0, 31))
+
+# --- child roles (see tests/xproc.nim) --------------------------------------
+
+proc hotRunProducer(args: seq[string]) =
+  ## Many producers pile onto ONE primary key, so everything they write lands in
+  ## one contiguous probe run, interleaved with a foreign key's bytes.
+  let
+    path0 = args[0]
+    c = parseInt(args[1])
+    perProc = parseInt(args[2])
+    dupFactor = parseInt(args[3])
+    weak = fpOf(args[4])
+    foreign = fpOf(args[5])
+  var cs = attachSetT(path0, AcIndexKey)
+  if not cs.available: exitChild(2)
+  for j in 0 ..< perProc:
+    let e = acRecord(weak, fpOf("hot-s-" & $c & "-" & $j), 0)
+    for _ in 0 ..< dupFactor:           # probe storm: re-observe
+      if cs.insert(e) notin {isInserted, isExists}:
+        cs.detach(); exitChild(3)
+  # a foreign edge, so the hot run is interleaved with another key's bytes
+  if cs.insert(acRecord(foreign, fpOf("foreign-s-" & $c), 0)) notin
+     {isInserted, isExists}:
+    cs.detach(); exitChild(4)
+  cs.detach()
+  exitChild(0)
+
+proc evictRaceProducer(args: seq[string]) =
+  ## Insert and evict the SAME identities from several processes at once, so the
+  ## tombstone ordering is decided under real contention.
+  let
+    path0 = args[0]
+    c = parseInt(args[1])
+    rounds = parseInt(args[2])
+    nKeys = parseInt(args[3])
+    weak = fpOf(args[4])
+  var cs = attachSetT(path0, AcIndexKey)
+  if not cs.available: exitChild(2)
+  for r in 0 ..< rounds:
+    for k in 0 ..< nKeys:
+      let strong = fpOf("race-s-" & $k)
+      if (k + c + r) mod 3 == 0:
+        if cs.acEvict(akRecord, weak, strong) notin
+           {isInserted, isExists}: exitChild(3)
+      else:
+        if cs.acInsert(akRecord, weak, strong) notin
+           {isInserted, isExists}: exitChild(4)
+  cs.detach()
+  exitChild(0)
+
+proc flattenRaceReader(args: seq[string]) =
+  ## Walk every edge's probe run in a loop while the parent flattens shards out
+  ## from under it, and fail the instant any expected element is unobservable in
+  ## ANY iteration. The expected table is RECOMPUTED here rather than inherited:
+  ## it is a pure function of `nEdges`, so the child derives exactly the parent's
+  ## table without depending on fork inheritance.
+  let
+    path0 = args[0]
+    nEdges = parseInt(args[1])
+    doneFile = args[2]
+  var expected = initTable[string, HashSet[string]]()
+  for i in 0 ..< nEdges:
+    let w = fpOf("fr-edge-" & $i)
+    var es = initHashSet[string]()
+    for j in 0 .. (i mod 3):
+      es.incl hexOf(acRecord(w, fpOf("fr-s-" & $i & "-" & $j), 0))
+    expected[hexOf(w)] = es
+  var rs = attachSetT(path0, AcIndexKey)
+  if not rs.available: exitChild(2)
+  var iter = 0
+  var sawDone = false
+  while iter < 100_000 and not sawDone:
+    sawDone = fileExists(doneFile)   # one more full pass AFTER the signal
+    for i in 0 ..< nEdges:
+      let w = fpOf("fr-edge-" & $i)
+      var got = initHashSet[string]()
+      for v in rs.withPrimaryKey(w):
+        if acIsWellFormed(v.bytes) and acWeak(v.bytes) == w:
+          got.incl hexOf(v.bytes)
+      for want in expected[hexOf(w)]:
+        if want notin got:
+          rs.detach(); exitChild(5)       # an element became unobservable
+    inc iter
+  rs.detach()
+  exitChild(0)
+
+registerChildRole("hotRunProducer", hotRunProducer)
+registerChildRole("evictRaceProducer", evictRaceProducer)
+registerChildRole("flattenRaceReader", flattenRaceReader)
+xprocChildEntry()
 
 proc unionForWeak(s: var ShmGSetT[AcIndexKey]; weak: Fp32): HashSet[string] =
   ## Every element the WHOLE-CHAIN union holds for this weak fingerprint, found
@@ -66,29 +151,12 @@ suite "H1. concurrent claims into ONE probe run (multi-process)":
     let weak = fpOf("hot-edge")
     let foreign = fpOf("foreign-edge")
 
-    var pids: seq[Pid]
+    var kids: seq[Child]
     for c in 0 ..< nProc:
-      let pid = fork()
-      if pid == 0:
-        var cs = attachSetT(path0, AcIndexKey)
-        if not cs.available: quitChild(2)
-        for j in 0 ..< perProc:
-          let e = acRecord(weak, fpOf("hot-s-" & $c & "-" & $j), 0)
-          for _ in 0 ..< dupFactor:           # probe storm: re-observe
-            if cs.insert(e) notin {isInserted, isExists}:
-              cs.detach(); quitChild(3)
-        # a foreign edge, so the hot run is interleaved with another key's bytes
-        if cs.insert(acRecord(foreign, fpOf("foreign-s-" & $c), 0)) notin
-           {isInserted, isExists}:
-          cs.detach(); quitChild(4)
-        cs.detach(); quitChild(0)
-      else:
-        check pid > 0
-        pids.add pid
-    for pid in pids:
-      var st: cint
-      check waitpid(pid, st, 0) == pid
-      check WIFEXITED(st) and WEXITSTATUS(st) == 0
+      kids.add startChild("hotRunProducer", path0, c, perProc, dupFactor,
+        "hot-edge", "foreign-edge")
+    for k in kids.mitems:
+      check waitChild(k) == 0
 
     var expected = initHashSet[string]()
     for c in 0 ..< nProc:
@@ -178,29 +246,12 @@ suite "H3. concurrent records AND tombstones converge":
     let path0 = s.path0
     let weak = fpOf("race-edge")
 
-    var pids: seq[Pid]
+    var kids: seq[Child]
     for c in 0 ..< nProc:
-      let pid = fork()
-      if pid == 0:
-        var cs = attachSetT(path0, AcIndexKey)
-        if not cs.available: quitChild(2)
-        for r in 0 ..< rounds:
-          for k in 0 ..< nKeys:
-            let strong = fpOf("race-s-" & $k)
-            if (k + c + r) mod 3 == 0:
-              if cs.acEvict(akRecord, weak, strong) notin
-                 {isInserted, isExists}: quitChild(3)
-            else:
-              if cs.acInsert(akRecord, weak, strong) notin
-                 {isInserted, isExists}: quitChild(4)
-        cs.detach(); quitChild(0)
-      else:
-        check pid > 0
-        pids.add pid
-    for pid in pids:
-      var st: cint
-      check waitpid(pid, st, 0) == pid
-      check WIFEXITED(st) and WEXITSTATUS(st) == 0
+      kids.add startChild("evictRaceProducer", path0, c, rounds, nKeys,
+        "race-edge")
+    for k in kids.mitems:
+      check waitChild(k) == 0
 
     # 1. No phantom: every element in the chain is one of the intended identities
     #    for this edge, well-formed, with a generation the counter dominates.
@@ -279,26 +330,7 @@ suite "H4. a reader walking a run concurrently with a flatten":
     # done (plus a hard iteration cap so the test can never hang). EVERY
     # iteration must be complete.
     let doneFile = dir / "flatten-done"
-    let reader = fork()
-    if reader == 0:
-      var rs = attachSetT(path0, AcIndexKey)
-      if not rs.available: quitChild(2)
-      var iter = 0
-      var sawDone = false
-      while iter < 100_000 and not sawDone:
-        sawDone = fileExists(doneFile)   # one more full pass AFTER the signal
-        for i in 0 ..< nEdges:
-          let w = fpOf("fr-edge-" & $i)
-          var got = initHashSet[string]()
-          for v in rs.withPrimaryKey(w):
-            if acIsWellFormed(v.bytes) and acWeak(v.bytes) == w:
-              got.incl hexOf(v.bytes)
-          for want in expected[hexOf(w)]:
-            if want notin got:
-              rs.detach(); quitChild(5)       # an element became unobservable
-        inc iter
-      rs.detach(); quitChild(0)
-    check reader > 0
+    var reader = startChild("flattenRaceReader", path0, nEdges, doneFile)
 
     # Flattener (this process): copy forward -> drain -> retire, for every shard
     # below the newest, while the reader is walking.
@@ -311,10 +343,7 @@ suite "H4. a reader walking a run concurrently with a flatten":
       check s.retireShard(k)
     writeFile(doneFile, "done")
 
-    var st: cint
-    check waitpid(reader, st, 0) == reader
-    check WIFEXITED(st)
-    check WEXITSTATUS(st) == 0                # the reader never saw a gap
+    check waitChild(reader) == 0               # the reader never saw a gap
 
     # And the post-flatten chain is still complete for every edge.
     for i in 0 ..< nEdges:

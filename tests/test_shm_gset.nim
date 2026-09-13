@@ -6,18 +6,17 @@
 ## oracle (final == union(intended): zero loss, zero phantom), SIGNALLED
 ## growth-failure, and the cross-restart reaper.
 
-import std/[os, posix, sets, strutils, unittest]
+import std/[os, sets, strutils, unittest]
 import shm_gset
+import ./xproc
 
-proc cExit(code: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
-proc quitChild(code: cint) {.noreturn.} = cExit(code)
+when defined(windows):
+  import std/winlean
+  proc getProcessHandleCount(p: Handle; n: ptr uint32): int32
+    {.stdcall, dynlib: "kernel32", importc: "GetProcessHandleCount".}
 
 var tmpCtr = 0
-proc freshDir(tag: string): string =
-  inc tmpCtr
-  result = getTempDir() / ("shmgset-" & tag & "-" & $getpid() & "-" & $tmpCtr)
-  removeDir(result)
-  createDir(result)
+proc freshDir(tag: string): string = freshTestDir("shmgset", tag, tmpCtr)
 
 proc bytesOf(s: string): seq[byte] =
   result = newSeq[byte](s.len)
@@ -27,7 +26,25 @@ proc strOf(b: seq[byte]): string =
   result = newString(b.len)
   for i in 0 ..< b.len: result[i] = char(b[i])
 
+# --- "a mapped shard retains no OS handle", instrumented per platform --------
+#
+# The property is commit 360bfc1's: once a shard is mapped, its backing
+# descriptor is CLOSED, so a process holding a long chain mapped does not also
+# hold a descriptor per shard. It is one property with two instruments, because
+# the two kernels expose "what is this process holding open" differently:
+#
+#   * Linux: walk `/proc/self/fd` and count the links that point AT the shard
+#     file. Direct and exact.
+#   * Windows: there is no per-path equivalent short of enumerating kernel handle
+#     tables, so the instrument is `GetProcessHandleCount` and the shape of the
+#     assertion changes from "zero point in time" to "does not GROW with the
+#     number of live mappings". That is the same claim: if each mapping retained
+#     its file handle, attaching N views would raise the count by N.
+#
+# Neither arm is the other's weaker cousin, and NEITHER IS A SKIP.
+
 when defined(linux):
+  import std/posix
   proc shardFdCount(pathPrefix: string): int =
     for fd in 3 .. 255:
       var buf: array[4096, char]
@@ -39,6 +56,46 @@ when defined(linux):
       copyMem(addr target[0], addr buf[0], n)
       if target.startsWith(pathPrefix):
         inc result
+
+when defined(windows):
+  proc ownHandleCount(): int =
+    var n: uint32 = 0
+    if getProcessHandleCount(getCurrentProcess(), addr n) == 0: return -1
+    int(n)
+
+# --- child roles (see tests/xproc.nim) --------------------------------------
+
+proc oracleProducer(args: seq[string]) =
+  ## One producer of the ground-truth oracle: attach, insert `perProc` distinct
+  ## elements `dupFactor` times each (the probe-storm shape), detach.
+  let
+    path0 = args[0]
+    c = parseInt(args[1])
+    perProc = parseInt(args[2])
+    dupFactor = parseInt(args[3])
+  var cs = attachSet(path0)
+  if not cs.available: exitChild(2)
+  for j in 0 ..< perProc:
+    let e = bytesOf("c" & $c & "/dep-" & $j)
+    for _ in 0 ..< dupFactor:
+      if cs.insert(e) notin {isInserted, isExists}:
+        cs.detach(); exitChild(3)   # saturation / unavailable = failure
+  cs.detach()
+  exitChild(0)
+
+proc makeAndLeakChain(args: seq[string]) =
+  ## Create a chain, put one element in it, and exit WITHOUT detaching or
+  ## unlinking — so the chain survives on disk with a dead owner pid, which is
+  ## exactly the input the reaper's staleness rule is specified against.
+  let (dir, appId, runId, elem) = (args[0], args[1], args[2], args[3])
+  var cs = createSet(dir, appId, runId, shard0Cap = 32, shard0ArenaCap = 1024)
+  if not cs.available: exitChild(2)
+  if cs.insert(bytesOf(elem)) notin {isInserted, isExists}: exitChild(3)
+  exitChild(0)
+
+registerChildRole("oracleProducer", oracleProducer)
+registerChildRole("makeAndLeakChain", makeAndLeakChain)
+xprocChildEntry()
 
 # --- basic membership + idempotency ----------------------------------------
 
@@ -57,6 +114,37 @@ suite "membership + idempotent inserts":
       check producer.insert(bytesOf("still-mapped")) == isInserted
       check owner.contains(bytesOf("still-mapped"))
       producer.detach()
+      owner.detach()
+
+  when defined(windows):
+    test "mapped shards do not retain backing file descriptors":
+      let dir = freshDir("fd-lifetime")
+      defer: removeDir(dir)
+      var owner = createSet(dir, "io-mon", "edge",
+        shard0Cap = 64, shard0ArenaCap = 8192)
+      check owner.available
+      check owner.insert(bytesOf("still-mapped")) == isInserted
+
+      # Hold MANY simultaneous views of the same chain. Each `attachSet` maps
+      # every shard in the chain; if a view retained its file handle, the
+      # process handle count would climb by at least one per attach.
+      const nViews = 64
+      let before = ownHandleCount()
+      check before >= 0
+      var views: seq[ShmGSet] = @[]
+      for _ in 0 ..< nViews:
+        var v = attachSet(owner.path0)
+        check v.available
+        check v.contains(bytesOf("still-mapped"))
+        views.add v
+      let during = ownHandleCount()
+      # TEETH: with the handle retained this delta is >= nViews (>= 64). The
+      # bound is deliberately far below that and far above zero, because a
+      # process's handle count is not perfectly quiet — the CRT and the loader
+      # may move it by a few at any time — and the defect this guards against
+      # is proportional to `nViews`, not a constant.
+      check during - before < nViews div 4
+      for v in views.mitems: v.detach()
       owner.detach()
 
   test "insert / contains / dedup":
@@ -149,28 +237,11 @@ suite "multi-process oracle (zero loss / zero phantom)":
     check s.available
     let path0 = s.path0
 
-    var pids: seq[Pid]
+    var kids: seq[Child]
     for c in 0 ..< nProc:
-      let pid = fork()
-      if pid == 0:
-        var cs = attachSet(path0)
-        if not cs.available: quitChild(2)
-        for j in 0 ..< perProc:
-          let e = bytesOf("c" & $c & "/dep-" & $j)
-          for _ in 0 ..< dupFactor:
-            if cs.insert(e) notin {isInserted, isExists}:
-              cs.detach(); quitChild(3)   # saturation / unavailable = failure
-        cs.detach()
-        quitChild(0)
-      else:
-        check pid > 0
-        pids.add(pid)
-
-    for pid in pids:
-      var st: cint
-      check waitpid(pid, st, 0) == pid
-      check WIFEXITED(st)
-      check WEXITSTATUS(st) == 0
+      kids.add startChild("oracleProducer", path0, c, perProc, dupFactor)
+    for k in kids.mitems:
+      check waitChild(k) == 0
 
     # ORACLE: the merged set must equal the union of every child's intended set,
     # exactly — no loss, no phantom.
@@ -199,16 +270,10 @@ suite "reaper (cross-restart GC)":
     check live.available
     check live.insert(bytesOf("x")) == isInserted
 
-    # Dead-owner run: fork a child that creates a set then exits; reap by pid.
-    let child = fork()
-    if child == 0:
-      var cs = createSet(dir, "io-mon", "deadEdge", shard0Cap = 32, shard0ArenaCap = 1024)
-      if not cs.available: quitChild(2)
-      discard cs.insert(bytesOf("y"))
-      # leak on purpose (no detach/unlink) then exit so its pid dies
-      quitChild(0)
-    var st: cint
-    discard waitpid(child, st, 0)
+    # Dead-owner run: a CHILD PROCESS creates a set then exits, so its pid dies
+    # and the chain it left behind is stale by the owner-pid axis.
+    var child = startChild("makeAndLeakChain", dir, "io-mon", "deadEdge", "y")
+    check waitChild(child) == 0
 
     # The dead run's shard0 exists on disk. The name carries the `io-mon~` appId
     # tag and an opaque chain uniquifier — NOT the runId, which lives in the
@@ -238,7 +303,7 @@ suite "reaper (cross-restart GC)":
     let dir = freshDir("reapboot")
     defer: removeDir(dir)
     let wrongBoot = bootId() + 1          # any value != the current boot-id
-    let livePid = uint64(getpid())        # a pid that IS alive on this boot
+    let livePid = uint64(ownPid())        # a pid that IS alive on this boot
     let stalePrefix = shardBasePrefix(dir, "io-mon", 1'u64, wrongBoot, livePid)
     let staleAnchor = stalePrefix & ".shard0"
     writeFile(staleAnchor, "forged wrong-boot shard0")
@@ -306,15 +371,9 @@ suite "reaper (cross-restart GC)":
     check bSet.available
     check bSet.insert(bytesOf("b")) == isInserted
 
-    # App A: a DEAD-owner run — fork a child that creates then exits so its pid dies.
-    let child = fork()
-    if child == 0:
-      var aSet = createSet(dir, "appA", "runA", shard0Cap = 32, shard0ArenaCap = 1024)
-      if not aSet.available: quitChild(2)
-      discard aSet.insert(bytesOf("a"))
-      quitChild(0)                          # leak on purpose; A becomes stale
-    var st: cint
-    discard waitpid(child, st, 0)
+    # App A: a DEAD-owner run — a child creates it then exits so its pid dies.
+    var child = startChild("makeAndLeakChain", dir, "appA", "runA", "a")
+    check waitChild(child) == 0
 
     var aAnchor, bAnchor = ""
     for _, p in walkDir(dir):
