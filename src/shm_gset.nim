@@ -95,16 +95,27 @@
 ## Deterministic SCHEDULE HOOKS (`shm_gset/hooks`, test-only `-d:shmGSetScheduleHooks`)
 ## seam every CAS/publish site so M2 can drive interleavings without a retrofit.
 ##
-## Portability: Linux + macOS (POSIX `mmap` MAP_SHARED). On any other platform
-## `shmGSetSupported` is false and every op reports unavailable (`supported=false`
-## arm), so a caller degrades gracefully.
+## Portability: Linux, macOS and Windows. Nothing about the ALGORITHM was ever
+## POSIX-specific — it is offsets, C11 atomics and one shared file mapping, and
+## none of the three needs a Unix — so the platform difference is confined to
+## `shm_gset/platform`, which spells a dozen syscalls once per OS (`mmap` /
+## `MapViewOfFileEx`, `unlink` / `DeleteFileW`, `flock` / `LockFileEx`, and so
+## on). Read that module's header for the one place the two kernels genuinely
+## disagree — deleting and renaming a file that is currently mapped — and for the
+## measurement showing the "persists == the file exists" contract is met
+## IDENTICALLY on Win32 rather than weakened to fit it.
+##
+## On any platform the shim does not cover, `shmGSetSupported` is false and every
+## op reports unavailable (`supported=false` arm), so a caller degrades
+## gracefully.
 
 import ./shm_gset/hooks
+import ./shm_gset/platform
 export hooks.SchedulePoint, hooks.scheduleHooksEnabled
 when defined(shmGSetScheduleHooks):
   export hooks.setScheduleHook, hooks.ScheduleHook
 
-const shmGSetSupported* = defined(linux) or defined(macosx)
+const shmGSetSupported* = shmGSetPlatformSupported
 
 const AppIdSep* = '~'
   ## Reserved separator between the caller-chosen appId and the rest of an anchor
@@ -518,14 +529,7 @@ func validRunId*(runId: string): bool =
   runId.len <= RunIdMaxBytes
 
 when shmGSetSupported:
-  import std/[os, posix, sets, strutils, times]
-
-  # BSD advisory whole-file lock (Linux + macOS share these op values). Used by
-  # the reaper to avoid GC'ing a run that is just starting.
-  proc flock(fd: cint; op: cint): cint {.importc, header: "<sys/file.h>".}
-  const
-    LOCK_EX = cint(2)
-    LOCK_NB = cint(4)
+  import std/[os, sets, strutils]
 
   type
     ShmBase = ptr UncheckedArray[byte]
@@ -636,11 +640,6 @@ when shmGSetSupported:
     atomicCompareExchangeN(atField(base, off, uint32), addr expected, desired,
       false, ATOMIC_ACQ_REL, ATOMIC_ACQUIRE)
 
-  when defined(macosx):
-    proc sysctlbyname(name: cstring; oldp: pointer; oldlenp: ptr csize_t;
-        newp: pointer; newlen: csize_t): cint
-      {.importc, header: "<sys/sysctl.h>".}
-
   proc bootId*(): uint64 =
     ## Per-boot identity — the value the header guard compares a shard's
     ## creator against, so that a chain surviving in a file-backed directory
@@ -666,25 +665,16 @@ when shmGSetSupported:
     ## kept only for a platform that has neither source; on such a host a chain
     ## is recreated more often than it needs to be, which costs a warm-up and
     ## never correctness.
-    when defined(linux):
-      try:
-        let raw = readFile("/proc/sys/kernel/random/boot_id")
-        var h: uint64 = 1469598103934665603'u64
-        for ch in raw:
-          if ch != '-' and ch != '\n':
-            h = (h xor uint64(ord(ch))) * 1099511628211'u64
-        return (h or 1'u64)
-      except CatchableError: discard
-    elif defined(macosx):
-      var tv: Timeval
-      var size = csize_t(sizeof(tv))
-      if sysctlbyname("kern.boottime", addr tv, addr size, nil, 0) == 0 and
-          size == csize_t(sizeof(tv)):
-        let secs = uint64(tv.tv_sec)
-        let usecs = uint64(tv.tv_usec)
-        if secs != 0'u64:
-          return ((secs * 1_000_000'u64 + usecs) or 1'u64)
-    (uint64(getTime().toUnix()) or 1'u64)
+    ##
+    ## WINDOWS inherits that lesson rather than repeating it: the obvious
+    ## primitive there, `GetTickCount64`, is an UPTIME — a duration, not an
+    ## identity — so two processes started a second apart read different values
+    ## for the same boot, which is precisely the Darwin defect. The authoritative
+    ## fixed-at-boot FILETIME is used instead. See `platformBootId`.
+    ##
+    ## The per-OS source lives in `shm_gset/platform`; this proc is the
+    ## documented contract it satisfies.
+    platformBootId()
 
   const
     GrowthFactor* = 4       ## per-shard capacity multiplier (§4.3.1: 4–8)
@@ -696,24 +686,31 @@ when shmGSetSupported:
   when defined(shmGSetScheduleHooks):
     var forcedNextMapBase {.threadvar.}: pointer
     proc setForcedNextMapBase*(p: pointer) =
-      ## TEST-ONLY (design spec §4.5(b)): force the NEXT shard `mmap` to land at a
-      ## deliberately chosen base via `MAP_FIXED`, so a test can prove the segment
+      ## TEST-ONLY (design spec §4.5(b)): force the NEXT shard mapping to land at
+      ## a deliberately chosen base — `MAP_FIXED` on POSIX, the `lpBaseAddress`
+      ## argument of `MapViewOfFileEx` on Win32 — so a test can prove the segment
       ## is position-independent (offsets only, no absolute pointers) even at a
       ## base of the test's choosing. The hint is consumed by one map and cleared.
+      ##
+      ## A chosen base must satisfy `shmGSetMapBaseAlignment`, which is 4 KiB on
+      ## POSIX and 64 KiB on Win32 (the allocation granularity; a merely
+      ## page-aligned base is rejected with ERROR_INVALID_ADDRESS). A test picks
+      ## its address from that constant rather than hard-coding a POSIX-legal
+      ## one.
       forcedNextMapBase = p
 
-  proc mapFd(fd: cint; size: int): ShmBase =
+  const shmGSetMapBaseAlignment* = mapBaseAlignment
+    ## The alignment `setForcedNextMapBase` requires of a chosen base on this
+    ## platform. Exported because it is a real platform difference a caller of
+    ## the test seam has to respect, not an implementation detail.
+
+  proc mapFd(fd: ShmFile; size: int): ShmBase =
     when defined(shmGSetScheduleHooks):
       if forcedNextMapBase != nil:
         let want = forcedNextMapBase
         forcedNextMapBase = nil
-        let pf = mmap(want, size, PROT_READ or PROT_WRITE,
-          MAP_SHARED or MAP_FIXED, fd, 0)
-        if pf == MAP_FAILED: return nil
-        return cast[ShmBase](pf)
-    let p = mmap(nil, size, PROT_READ or PROT_WRITE, MAP_SHARED, fd, 0)
-    if p == MAP_FAILED: return nil
-    cast[ShmBase](p)
+        return cast[ShmBase](mapShared(fd, size, want))
+    cast[ShmBase](mapShared(fd, size))
 
   const ArenaGuardBytes = 8
     ## The arena bump pointer starts here rather than at 0, so an arena-relative
@@ -820,7 +817,7 @@ when shmGSetSupported:
       return afWrongBoot
     afNone
 
-  proc mapShardFromFd(fd: cint; size: int; boot: uint64; fmtVersion: uint32;
+  proc mapShardFromFd(fd: ShmFile; size: int; boot: uint64; fmtVersion: uint32;
       failure: var AttachFailure): ShardMap =
     let base = mapFd(fd, size)
     if base.isNil:
@@ -828,7 +825,7 @@ when shmGSetSupported:
     let why = headerCheck(base, boot, fmtVersion)
     if why != afNone:
       failure = why
-      discard munmap(cast[pointer](base), size); return
+      unmapShared(cast[pointer](base), size); return
     result.base = base
     result.size = size
     result.cap = int(loadU64Relaxed(base, ShOffCapacity))
@@ -858,12 +855,12 @@ when shmGSetSupported:
           s.failure = afMissing; return false
         if size <= ShardHeaderSize:
           s.failure = afTruncated; return false
-        let fd = open(path.cstring, O_RDWR)
-        if fd < 0:
+        let fd = openReadWrite(path)
+        if not fd.isValid:
           s.failure = afMissing; return false
         var why = afNone
         let sm = mapShardFromFd(fd, size, s.boot, keyFormatVersion(K), why)
-        discard close(fd)
+        closeFile(fd)
         if sm.base.isNil:
           s.failure = why
           return false
@@ -875,7 +872,7 @@ when shmGSetSupported:
       inc tries
       if tries > 10000:
         s.failure = afMissing; return false
-      discard sched_yield()
+      yieldThread()
 
   proc chainCount[K](s: var ShmGSetT[K]): int {.inline.} =
     int(loadU64Acquire(s.shards[0].base, ShOffChainCount))
@@ -1014,7 +1011,7 @@ when shmGSetSupported:
     occ * uint64(LoadDen) >= uint64(sm.cap * LoadNum)
 
   # Process-global tmp uniquifier. A per-`ShmGSet` counter is NOT enough: two
-  # producer THREADS in the same process share `getpid()` and both start their
+  # producer THREADS in the same process share `currentPid()` and both start their
   # own `tmpCtr` at 1, so they would forge the SAME `.shardtmp.<pid>.1` name and
   # the `O_EXCL` loser's `EEXIST` would be misreported as a growth failure
   # (SIGNALLED saturation) even though growth succeeded. An atomic process-global
@@ -1043,34 +1040,34 @@ when shmGSetSupported:
       # growth FAILS here instead — the SIGNALLED saturation path (LF: never a
       # silent drop, and `growthFailures > 0` grades the edge `mcIncomplete`).
       return false
-    var tfd = cint(-1)
+    var tfd = InvalidShmFile
     var tmp: string
     var attempts = 0
     while true:
       let uniq = atomicAddFetch(addr gShardTmpSeq, 1'u64, ATOMIC_SEQ_CST)
-      tmp = s.basePrefix & ".shardtmp." & $getpid() & "." & $uniq
-      tfd = open(tmp.cstring, O_RDWR or O_CREAT or O_EXCL, 0o600)
-      if tfd >= 0: break
+      tmp = s.basePrefix & ".shardtmp." & $currentPid() & "." & $uniq
+      tfd = openNewExclusive(tmp)
+      if tfd.isValid: break
       # A colliding temp NAME (a sibling producer thread in this same process, or
       # a stale leftover from a crashed same-pid run) must NOT be reported as a
       # growth failure — pick a fresh name and retry. Any other error is real.
-      if errno != EEXIST: return false
+      if not lastOpenFailedBecauseItExists(): return false
       inc attempts
       if attempts > 4096: return false
-    if ftruncate(tfd, Off(size)) != 0:
-      discard close(tfd); discard unlink(tmp.cstring); return false
+    if not setFileSize(tfd, size):
+      closeFile(tfd); unlinkPath(tmp); return false
     let base = mapFd(tfd, size)
     if base.isNil:
-      discard close(tfd); discard unlink(tmp.cstring); return false
+      closeFile(tfd); unlinkPath(tmp); return false
     initShardHeader(base, newIndex, newCap, newArenaCap, s.boot, 0,
       keyFormatVersion(K), extraWords)
-    discard munmap(cast[pointer](base), size)
-    discard close(tfd)
+    unmapShared(cast[pointer](base), size)
+    closeFile(tfd)
     scheduleHook(spBeforeShardLink)
-    let linked = link(tmp.cstring, finalPath.cstring)
+    let linked = linkExclusive(tmp, finalPath)
     scheduleHook(spAfterShardLink)
-    discard unlink(tmp.cstring)       # drop the temp name either way
-    if linked == 0: return true
+    unlinkPath(tmp)       # drop the temp name either way
+    if linked: return true
     return fileExists(finalPath)      # a racer created it first (EEXIST)
 
   proc growNewest[K](s: var ShmGSetT[K]; expectedN: int; full: ShardMap;
@@ -1142,7 +1139,7 @@ when shmGSetSupported:
     while true:
       let seqNo = atomicAddFetch(addr gChainSeq, 1'u64, ATOMIC_SEQ_CST)
       result.basePrefix = shardBasePrefix(dir, appId, seqNo, result.boot,
-        uint64(getpid()))
+        currentPid())
       result.path0 = result.basePrefix & ".shard0"
       if not fileExists(result.path0): break
       inc attempts
@@ -1153,27 +1150,27 @@ when shmGSetSupported:
     let size = shardFileSize(shard0Cap, shard0ArenaCap, extraWords)
     if uint64(size) >= MaxShardBytes: return   # see `appendShardFile`
     inc result.tmpCtr
-    let tmp = result.path0 & ".tmp." & $getpid()
-    let tfd = open(tmp.cstring, O_RDWR or O_CREAT or O_EXCL, 0o600)
-    if tfd < 0: return
-    if ftruncate(tfd, Off(size)) != 0:
-      discard close(tfd); discard unlink(tmp.cstring); return
+    let tmp = result.path0 & ".tmp." & $currentPid()
+    let tfd = openNewExclusive(tmp)
+    if not tfd.isValid: return
+    if not setFileSize(tfd, size):
+      closeFile(tfd); unlinkPath(tmp); return
     let base = mapFd(tfd, size)
     if base.isNil:
-      discard close(tfd); discard unlink(tmp.cstring); return
+      closeFile(tfd); unlinkPath(tmp); return
     # Generation 1 is the first live generation (0 is `GenerationNone`, the
     # value every un-stamped word already holds).
     initShardHeader(base, 0, shard0Cap, shard0ArenaCap, result.boot, 1,
       keyFormatVersion(K), extraWords, 1'u64, runId)
-    discard munmap(cast[pointer](base), size)
-    discard close(tfd)
+    unmapShared(cast[pointer](base), size)
+    closeFile(tfd)
     try: moveFile(tmp, result.path0)
     except OSError:
-      discard unlink(tmp.cstring); return
+      unlinkPath(tmp); return
     if not openShard(result, 0): return
     # Register consumer liveness (LF-4 / reaper).
     storeU64Relaxed(result.shards[0].base, ShOffConsumerBoot, result.boot)
-    storeU64Relaxed(result.shards[0].base, ShOffConsumerPid, uint64(getpid()))
+    storeU64Relaxed(result.shards[0].base, ShOffConsumerPid, currentPid())
     storeU64Release(result.shards[0].base, ShOffConsumerAlive, 1)
     result.failure = afNone
     result.available = true
@@ -1206,9 +1203,11 @@ when shmGSetSupported:
   # correctness.
 
   proc pidAlive(pid: uint64): bool =
-    if pid == 0: return false
-    if kill(Pid(pid), cint(0)) == 0: return true
-    errno != ESRCH
+    ## "is this pid still running?" — `kill(pid, 0)` on POSIX,
+    ## `OpenProcess` + a zero-timeout wait on Win32. Both report a pid we may not
+    ## SIGNAL or OPEN as ALIVE, so the reaper can only ever refuse to collect,
+    ## never collect a live run. See `processAlive`.
+    processAlive(pid)
 
   proc reclaimDeadProducers(base: ShmBase) =
     ## CAS-clear registry entries whose pid is gone. Called only when the table
@@ -1223,7 +1222,7 @@ when shmGSetSupported:
     ## Claim a registry entry for this process. Returns the index, or -1 when the
     ## registry is full (the caller is then counted in the overflow word).
     ## The claim is SEQ_CST — see `loadU64Seq` and `reset`.
-    let me = uint64(getpid())
+    let me = currentPid()
     let start = int(me mod uint64(MaxRegisteredProducers))
     for attempt in 0 .. 1:
       for i in 0 ..< MaxRegisteredProducers:
@@ -1247,7 +1246,7 @@ when shmGSetSupported:
     ## quiescent — the cardinal sin, arrived at through the very mechanism that
     ## exists to make forking safe. Comparing `ownerPid` against the caller's pid
     ## makes the release a no-op in the child, which then registers itself.
-    let me = uint64(getpid())
+    let me = currentPid()
     if ownerPid != me: return                 # an inherited handle: not ours
     if slot >= 0 and slot < MaxRegisteredProducers:
       var expected = ownerPid
@@ -1344,17 +1343,17 @@ when shmGSetSupported:
         let slot = registerProducer(b)
         if loadU64Seq(b, ShOffResetSeal) == 0'u64:
           result.producerSlot = slot
-          result.producerPid = uint64(getpid())
+          result.producerPid = currentPid()
           break
-        unregisterProducer(b, slot, uint64(getpid()))
+        unregisterProducer(b, slot, currentPid())
       inc spins
       if spins > AttachSealSpins:
         result.failure = afRecycling
         result.shards[0].base = nil
-        discard munmap(cast[pointer](b), result.shards[0].size)
+        unmapShared(cast[pointer](b), result.shards[0].size)
         result.shards.setLen(0)
         return
-      discard sched_yield()
+      yieldThread()
     bumpGenStamped(b, ShOffProducerAttaches, headerGeneration(b), 1)
     result.failure = afNone
     result.available = true
@@ -1376,7 +1375,7 @@ when shmGSetSupported:
     s.producerPid = 0
     for sm in s.shards.mitems:
       if not sm.base.isNil:
-        discard munmap(cast[pointer](sm.base), sm.size)
+        unmapShared(cast[pointer](sm.base), sm.size)
         sm.base = nil
     s.shards.setLen(0)
     s.available = false
@@ -1728,15 +1727,15 @@ when shmGSetSupported:
     ## compare this against `ShmGSetLayoutRevision` and get "the chain is
     ## revision 2, this build speaks revision 3" instead of an empty set.
     result = -1
-    let fd = open(path.cstring, O_RDONLY)
-    if fd < 0: return
+    let fd = openReadOnly(path)
+    if not fd.isValid: return
     var buf: array[8, byte]
     var got = 0
     while got < 8:
-      let n = read(fd, addr buf[got], 8 - got)
+      let n = readSome(fd, addr buf[got], 8 - got)
       if n <= 0: break
       got += n
-    discard close(fd)
+    closeFile(fd)
     if got < 8: return
     var magic: uint64
     copyMem(addr magic, addr buf[0], 8)
@@ -1816,7 +1815,7 @@ when shmGSetSupported:
     writeRunIdSlot(b, next, runId)
     scheduleHook(spBeforeLivenessRearm)
     storeU64Relaxed(b, ShOffConsumerBoot, s.boot)
-    storeU64Relaxed(b, ShOffConsumerPid, uint64(getpid()))
+    storeU64Relaxed(b, ShOffConsumerPid, currentPid())
     storeU64Release(b, ShOffConsumerAlive, 1)
     scheduleHook(spBeforeGenerationPublish)
     storeU64Release(b, ShOffGeneration, next)   # COMMIT
@@ -1908,7 +1907,8 @@ when shmGSetSupported:
 
   # --- reaper (cross-restart GC, design spec §4.3.4) ------------------------
 
-  proc readAnchorRunId(anchor: string): tuple[fromHeader: bool; runId: string] =
+  proc readAnchorRunId(anchor: string;
+      held = InvalidShmFile): tuple[fromHeader: bool; runId: string] =
     ## Read a chain's RUN IDENTITY out of shard0's header with a plain bounded
     ## `read` — nothing is mapped and no field is trusted. The reaper points this
     ## at whatever files it finds in a shared directory, which include legacy
@@ -1920,16 +1920,31 @@ when shmGSetSupported:
     ## field sits at a fixed offset in the shared header layout, so the reaper
     ## stays key-discipline agnostic and can attribute a chain written under any
     ## policy.
+    ##
+    ## `held` is an ALREADY-OPEN descriptor for this same anchor, and passing it
+    ## is not an optimisation — it is required for correctness where the caller
+    ## holds the exclusive lock. The reaper opens shard0, takes
+    ## `tryLockExclusive` on it, and only then asks for the identity. POSIX
+    ## `flock` is ADVISORY, so re-opening the file and reading it a second time
+    ## works there; `LockFileEx` is MANDATORY, so on Win32 that second read is
+    ## refused with ERROR_LOCK_VIOLATION and the whole header comes back empty.
+    ## The symptom was not an error anywhere: `fromHeader` went false and every
+    ## reaped segment was attributed to the NAME's opaque `chainSeq` instead of
+    ## its real runId — reported as `runId was 1` where `runA` was expected.
+    ## Reading through the descriptor that already holds the lock is correct on
+    ## both platforms and does one less `open` besides.
     result = (false, "")
-    let fd = open(anchor.cstring, O_RDONLY)
-    if fd < 0: return
+    let own = not held.isValid
+    let fd = if own: openReadOnly(anchor) else: held
+    if not fd.isValid: return
+    if not own and not seekToStart(fd): return
     var buf: array[ShardHeaderSize, byte]
     var got = 0
     while got < ShardHeaderSize:
-      let n = read(fd, addr buf[got], ShardHeaderSize - got)
+      let n = readSome(fd, addr buf[got], ShardHeaderSize - got)
       if n <= 0: break
       got += n
-    discard close(fd)
+    if own: closeFile(fd)
     if got < ShardHeaderSize: return       # too small to carry a header
     var magic: uint64
     copyMem(addr magic, addr buf[ShOffMagic], 8)
@@ -1968,7 +1983,8 @@ when shmGSetSupported:
     ## reuse cannot misfire. WITHIN the matching appId the staleness rule is
     ## unchanged: reap the whole chain when boot != currentBoot (survived a
     ## reboot ⇒ pids meaningless) OR the owner pid is dead on the current boot. A
-    ## live-owner run is left alone. An `flock(LOCK_EX|LOCK_NB)` on shard0 guards
+    ## live-owner run is left alone. An exclusive non-blocking whole-file lock on
+    ## shard0 (`flock(LOCK_EX|LOCK_NB)`, `LockFileEx` on Win32) guards
     ## a run that is just starting.
     ##
     ## MIGRATION: a chain written under the pre-HM-1 naming
@@ -2001,13 +2017,13 @@ when shmGSetSupported:
       let stale = (boot != cur) or (not pidAlive(pid))
       if not stale: continue
       # Guard against reaping a run that is just starting.
-      let fd = open(anchor.cstring, O_RDWR)
-      if fd >= 0:
-        let locked = flock(fd, LOCK_EX or LOCK_NB) == 0
+      let fd = openReadWrite(anchor)
+      if fd.isValid:
+        let locked = tryLockExclusive(fd)
         if not locked:
-          discard close(fd); continue     # someone holds it: leave it
+          closeFile(fd); continue     # someone holds it: leave it
       # Attribute BEFORE unlinking — the identity lives in the file.
-      let ident = readAnchorRunId(anchor)
+      let ident = readAnchorRunId(anchor, fd)
       var seg = ReapedSegment(anchor: anchor, boot: boot, ownerPid: pid,
         runIdFromHeader: ident.fromHeader,
         runId: (if ident.fromHeader: ident.runId else: parts[0]))
@@ -2020,7 +2036,7 @@ when shmGSetSupported:
           removeFile(sp); inc seg.filesRemoved
         except CatchableError: discard
         inc k
-      if fd >= 0: discard close(fd)
+      if fd.isValid: closeFile(fd)
       result.add seg
 
   proc reapStaleSegments*(dir, appId: string): int =

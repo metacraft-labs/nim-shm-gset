@@ -286,6 +286,45 @@ type
     ## A process-local pool of recyclable chains, shared by every host thread.
     ## Created with `newSetPool`, released with `destroySetPool`. See
     ## `SetPoolObj` for why this is a `ptr` and not a `ref`.
+    ##
+    ## =========================================================================
+    ## SHUTDOWN ORDER, ON WINDOWS, IS A CONTRACT AND NOT A STYLE CHOICE
+    ## =========================================================================
+    ##
+    ## **Close (or destroy) the pool while the host threads that used it are
+    ## still alive, or build with `-d:useMalloc`.** Joining every worker and THEN
+    ## calling `close` crashes on Windows, inside the Nim runtime, intermittently.
+    ##
+    ## WHY. `acquire` runs on a host thread, and the chain it creates carries
+    ## GC'd state — `path0`, `basePrefix`, the shard seq — allocated on THAT
+    ## thread's heap. `release` parks the chain in `p.idle`, and `close` on the
+    ## main thread frees it. Under Nim's default ORC allocator every thread owns
+    ## a `MemRegion`, and freeing another thread's block hands it to
+    ## `addToSharedFreeList`, which dereferences the owning region. Once that
+    ## thread has EXITED its region is gone, and the free is a use-after-free.
+    ##
+    ## MEASURED, on Nim 2.2.8 / Windows 11:
+    ##
+    ##   | shutdown order                  | default ORC | `-d:useMalloc` |
+    ##   |---------------------------------|-------------|----------------|
+    ##   | join workers, then `close`      | SIGSEGV, ~2 runs in 3 | clean |
+    ##   | `close` while workers are alive | clean       | clean          |
+    ##
+    ## The crash is `SIGSEGV` at `system/alloc.nim` `addToSharedFreeList`, with
+    ## `close` -> `retireLocked` -> `dealloc` above it. It reproduces in
+    ## twenty-five lines with no `shm_gset` code at all (six threads appending
+    ## strings to a seq in `allocShared` memory under a lock; the main thread
+    ## frees them after `joinThreads`), so it is a property of the TOOLCHAIN on
+    ## that platform, not of this module — and `--mm:atomicArc` does NOT help,
+    ## because the fault is in the allocator and not in the reference counts.
+    ##
+    ## On Linux the same program is clean (measured 6 runs of 6): an exited
+    ## thread's region there still happens to be readable, so the identical
+    ## use-after-free does not fault. THAT IS LUCK, NOT SAFETY. The ordering rule
+    ## above is the portable one and is worth following on every platform.
+    ##
+    ## `tests/test_shm_gset_pool.nim`'s concurrency case follows it deliberately
+    ## and says so at the call site.
 
   SetLease* = object
     ## An action's exclusive borrow of one pooled chain.

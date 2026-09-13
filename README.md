@@ -55,8 +55,30 @@ regardless of write order, writer, or duplication.
   never carry a stale name-borne `runId`.
 - **Deterministic schedule hooks** (`-d:shmGSetScheduleHooks`): test-only seams
   at every CAS/publish site so interleavings can be driven deterministically.
-- **Portable no-op arm**: compiles everywhere; `shmGSetSupported == false` off
-  Linux/macOS, where every op reports unavailable.
+- **Linux, macOS and Windows**, natively. Nothing about the algorithm was ever
+  POSIX-specific — it is offsets, C11 atomics and one shared file mapping — so
+  the whole platform difference lives in `shm_gset/platform`, which spells a
+  dozen syscalls once per OS (`mmap`/`MapViewOfFileEx`, `unlink`/`DeleteFileW`,
+  `flock`/`LockFileEx`, `kill(pid, 0)`/`OpenProcess`, and so on).
+
+  The durability contract, **"persists == the file exists"**, is met
+  IDENTICALLY on Win32 rather than weakened to fit it. The common belief that
+  Windows forbids deleting or renaming a mapped file is a property of the SHARE
+  MODE, not of the mapping: every open here passes `FILE_SHARE_DELETE`, and a
+  view then stays fully readable and writable after its name is gone, exactly
+  as on POSIX. `tests/test_shm_gset_platform.nim` measures that on both
+  platforms, including the reaper's own sequence (unlink while a descriptor is
+  still open), which is the case that makes the share mode load-bearing — drop
+  `FILE_SHARE_DELETE` and only that case fails. The one restriction Win32 really
+  does impose is SHRINKING a mapped file, which growth-by-sharding never does:
+  a shard is sized once, on a fresh temp file, before it is ever mapped.
+
+  If you drive `shm_gset/pool` from several host threads on Windows, read the
+  shutdown-order contract on `SetPool` first — it is a real constraint, not a
+  style note.
+- **Portable no-op arm**: still compiles everywhere else; `shmGSetSupported ==
+  false` on any platform the shim does not cover, where every op reports
+  unavailable.
 
 ## The key discipline is a parameter
 
