@@ -23,11 +23,16 @@
   # rather than a re-packaging job.
   inputs.nixpkgs-llvm15.url = "github:NixOS/nixpkgs/ac62194c3917d5f474c1a844b6fd6da2db95077d";
 
+  # The repo's pre-commit hooks (see `preCommit` below).
+  inputs.git-hooks.url = "github:cachix/git-hooks.nix";
+  inputs.git-hooks.inputs.nixpkgs.follows = "nixpkgs";
+
   outputs =
     {
       self,
       nixpkgs,
       nixpkgs-llvm15,
+      git-hooks,
     }:
     let
       systems = [
@@ -97,6 +102,16 @@
             self'.nidhugg
             self'.cdschecker
           ];
+
+          # The repo's pre-commit hooks. Entering either shell below writes the
+          # (gitignored) .pre-commit-config.yaml symlink and installs them.
+          preCommit = git-hooks.lib.${system}.run {
+            src = ./.;
+            hooks = {
+              check-added-large-files.enable = true;
+              check-merge-conflicts.enable = true;
+            };
+          };
         in
         {
           # gcc15Stdenv, not the pin's default gcc14. LOAD-BEARING: `just
@@ -143,6 +158,7 @@
             # would bury the actual verification output under six copies of
             # itself.
             shellHook = ''
+              ${preCommit.shellHook}
               if [ -t 1 ]; then
                 echo "nim-shm-gset verification shell (pinned)"
                 for t in tlc herd7 genmc nidhugg cdschecker; do
@@ -153,6 +169,12 @@
             '';
           };
 
+          # Just the hooks, for CI's shared lint workflow: the default shell
+          # above builds the model checkers, which a hook run never needs.
+          pre-commit = pkgs.mkShell {
+            packages = [ pkgs.prek ] ++ preCommit.enabledPackages;
+            shellHook = preCommit.shellHook;
+          };
         }
       );
 
