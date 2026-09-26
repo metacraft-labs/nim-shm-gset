@@ -96,6 +96,9 @@ test: check-runner-parity
     # the Win32 share mode load-bearing), exclusive publish, the whole-file lock
     # excluding another process, `processAlive`, and a boot identity that is the
     # same in a second process a second later.
+    # Every Nim compile in this checkout keeps its nimcache inside the checkout
+    # (config.nims); a shared ~/.cache/nim lets two checkouts link each other.
+    nim c -r {{nim_flags}} tests/test_nimcache_is_worktree_local.nim
     nim c -r {{nim_flags}} tests/test_shm_gset_platform.nim
     nim c -r {{nim_flags}} tests/test_shm_gset.nim
     nim c -r {{nim_flags}} tests/test_shm_gset_transport.nim

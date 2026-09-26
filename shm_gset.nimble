@@ -37,6 +37,9 @@ task test, "Build + run the nim-shm-gset test suite":
   # the Win32 share mode load-bearing), exclusive publish, the whole-file lock
   # excluding another process, `processAlive`, and a boot identity that is the
   # same in a second process a second later.
+  # Every Nim compile in this checkout keeps its nimcache inside the checkout
+  # (config.nims); a shared ~/.cache/nim lets two checkouts link each other.
+  exec "nim c -r " & testFlags & " tests/test_nimcache_is_worktree_local.nim"
   exec "nim c -r " & testFlags & " tests/test_shm_gset_platform.nim"
   # Functional + concurrency (multi-process) suite for the sharded G-Set.
   exec "nim c -r " & testFlags & " tests/test_shm_gset.nim"

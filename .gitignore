@@ -1,5 +1,8 @@
 # Nim build artifacts
 nimcache/
+# Per-checkout nimcache (config.nims): every Nim compile in this checkout
+# keeps its intermediate files here, never in the shared ~/.cache/nim.
+.nimcache/
 *.exe
 # Compiled test / benchmark binaries (no extension on POSIX)
 tests/test_shm_gset
