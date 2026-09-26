@@ -19,6 +19,7 @@ tests/test_shm_gset_soak
 tests/test_shm_gset_keyed
 tests/test_shm_gset_keyed_concurrency
 tests/test_shm_gset_pool
+tests/test_nimcache_is_worktree_local
 tests/helpers/lease_copy_probe
 tests/helpers/pool_lifecycle_probe
 benchmarks/bench_transports
