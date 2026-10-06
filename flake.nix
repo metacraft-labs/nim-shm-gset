@@ -149,51 +149,56 @@
           # workspace's ambient toolchain is also gcc 15, so this keeps the
           # flake and the ambient shell producing the same result rather than
           # the flake silently losing the TSAN leg of §4.5(g).
-          default = (pkgs.mkShell.override { stdenv = pkgs.gcc15Stdenv; }) {
-            name = "nim-shm-gset-verification";
+          default =
+            (pkgs.mkShell.override {
+              stdenv = if pkgs.stdenv.hostPlatform.isLinux then pkgs.gcc15Stdenv else pkgs.stdenv;
+            })
+              {
+                name = "nim-shm-gset-verification";
 
-            packages = [
-              # Build + functional suite. Same Nim VERSION (2.2.4) the
-              # workspace shell provides, from the pinned nixpkgs.
-              pkgs.nim
-              # nimble is a SEPARATE derivation: nixpkgs' `nim` is a wrapper
-              # that ships nim, nimsuggest, nimpretty, nimgrep and testament,
-              # but NOT nimble. This repo has two test runners — the Justfile
-              # `test` recipe and the `test` task in shm_gset.nimble — and the
-              # campaign's own rule is that a required test must not be
-              # reachable from one runner only. That rule could not be CHECKED
-              # here: nimble was in neither the workspace shell nor this flake,
-              # so `nimble test` exited 127 and the nimble task had only ever
-              # been reviewed by reading it. It is in the shell now so the two
-              # runners can actually be reconciled by running them.
-              pkgs.nimble
-              pkgs.just
-              pkgs.pkg-config
+                packages = [
+                  # Build + functional suite. Same Nim VERSION (2.2.4) the
+                  # workspace shell provides, from the pinned nixpkgs.
+                  pkgs.nim
+                  # nimble is a SEPARATE derivation: nixpkgs' `nim` is a wrapper
+                  # that ships nim, nimsuggest, nimpretty, nimgrep and testament,
+                  # but NOT nimble. This repo has two test runners — the Justfile
+                  # `test` recipe and the `test` task in shm_gset.nimble — and the
+                  # campaign's own rule is that a required test must not be
+                  # reachable from one runner only. That rule could not be CHECKED
+                  # here: nimble was in neither the workspace shell nor this flake,
+                  # so `nimble test` exited 127 and the nimble task had only ever
+                  # been reviewed by reading it. It is in the shell now so the two
+                  # runners can actually be reconciled by running them.
+                  pkgs.nimble
+                  pkgs.just
+                  pkgs.pkg-config
 
-              # §4.5(a) formal tier.
-              pkgs.tlaplus # tlc, tlasany, pcal
+                  # §4.5(a) formal tier.
+                  pkgs.tlaplus # tlc, tlasany, pcal
 
-              # §4.5(g) dynamic tier (previously ambient, now pinned too).
-              pkgs.valgrind
-            ]
-            ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.rr
-            ++ modelCheckers;
+                ]
+                ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+                  pkgs.valgrind
+                  pkgs.rr
+                ]
+                ++ modelCheckers;
 
-            # Only when a human is looking. `just verify-*` runs every recipe
-            # line through `nix develop --command`, and an unconditional banner
-            # would bury the actual verification output under six copies of
-            # itself.
-            shellHook = ''
-              ${ownRepoOnly preCommit.shellHook}
-              if [ -t 1 ]; then
-                echo "nim-shm-gset verification shell (pinned)"
-                for t in tlc herd7 genmc nidhugg cdschecker; do
-                  printf '  %-11s %s\n' "$t" \
-                    "$(command -v "$t" >/dev/null && echo yes || echo MISSING)"
-                done
-              fi
-            '';
-          };
+                # Only when a human is looking. `just verify-*` runs every recipe
+                # line through `nix develop --command`, and an unconditional banner
+                # would bury the actual verification output under six copies of
+                # itself.
+                shellHook = ''
+                  ${ownRepoOnly preCommit.shellHook}
+                  if [ -t 1 ]; then
+                    echo "nim-shm-gset verification shell (pinned)"
+                    for t in tlc herd7 genmc nidhugg cdschecker; do
+                      printf '  %-11s %s\n' "$t" \
+                        "$(command -v "$t" >/dev/null && echo yes || echo MISSING)"
+                    done
+                  fi
+                '';
+              };
 
           # Just the hooks, for CI's shared lint workflow: the default shell
           # above builds the model checkers, which a hook run never needs.
