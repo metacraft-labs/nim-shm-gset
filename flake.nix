@@ -103,7 +103,14 @@
             self'.cdschecker
           ];
 
-          # git-hooks.nix installs `.pre-commit-config.yaml` and git hooks into
+          # The committed `.pre-commit-config.yaml` is what the pre-commit hook
+          # runs, with the flake's pre-commit: the flake provides the tools, the
+          # committed config provides the rules. git-hooks.nix's own installer
+          # refuses to replace a committed config and then installs nothing.
+          installGitHooks = ''
+            bash ${./scripts/install-git-hooks.sh} ${pkgs.lib.getExe preCommit.config.package} || exit $?
+          '';
+          # The hooks are installed into
           # `git rev-parse --show-toplevel` of the directory the shell is entered
           # from, so `nix develop /path/to/<this repo>` run inside another checkout
           # would plant this repository's hooks there. `ownRepoOnly` runs a snippet
@@ -117,18 +124,19 @@
               && [ "$(${pkgs.coreutils}/bin/sha256sum "$_own_repo_root/flake.nix" | ${pkgs.coreutils}/bin/cut -d' ' -f1)" \
                 = "${builtins.hashFile "sha256" ./flake.nix}" ]; then
             ${script}
-            # git-hooks.nix's installer leaves core.hooksPath as the RELATIVE
-            # `.git/hooks`, in the config every worktree shares. A linked worktree
-            # cannot resolve it (there `.git` is a file), so git silently runs no
-            # hooks there. Point it at the common hooks directory instead.
+            # A clone where git-hooks.nix's own installer once ran keeps its RELATIVE
+            # core.hooksPath `.git/hooks`, in the config every worktree shares. A linked
+            # worktree cannot resolve it (there `.git` is a file), so git silently runs
+            # no hooks there. Point it at the common hooks directory instead.
             if [ "$(${pkgs.git}/bin/git config --local --get core.hooksPath 2>/dev/null)" = .git/hooks ]; then
               ${pkgs.git}/bin/git config --local core.hooksPath "$(${pkgs.git}/bin/git rev-parse --path-format=absolute --git-common-dir)/hooks"
             fi
-            # The installer moves each Reprobuild hook dispatcher aside to
-            # `<hook>.legacy` and puts pre-commit's shim in its slot, so the managed
-            # hook (for pre-push, the publication gate) runs only by accident. Put the
-            # dispatcher back and chain the shim as `<hook>.repro-local`, which the
-            # dispatcher runs: the layout `repro hooks ensure --vcs` produces.
+            # `pre-commit install` (and git-hooks.nix's installer, where it once ran)
+            # moves each Reprobuild hook dispatcher aside to `<hook>.legacy` and puts
+            # its shim in the slot, so the managed hook (for pre-push, the publication
+            # gate) runs only by accident. Put the dispatcher back and chain the shim as
+            # `<hook>.repro-local`, which the dispatcher runs: the layout
+            # `repro hooks ensure --vcs` produces.
             _hooks="$(${pkgs.git}/bin/git rev-parse --path-format=absolute --git-path hooks 2>/dev/null || true)"
             for _legacy in "$_hooks"/*.legacy; do
               [ -f "$_legacy" ] && grep -q 'reprobuild hook dispatcher' "$_legacy" || continue
@@ -151,9 +159,10 @@
             unset _own_repo_root
           '';
 
-          # The repo's pre-commit hooks. Entering either shell below writes the
-          # (gitignored) .pre-commit-config.yaml symlink and installs them when
-          # entered from inside this repository (see `ownRepoOnly` above).
+          # The flake's hook set, run by `nix flake check`. Entering either shell
+          # below installs the committed .pre-commit-config.yaml as the git hook,
+          # with this set's pre-commit, when entered from inside this repository
+          # (see `installGitHooks` and `ownRepoOnly` above).
           preCommit = git-hooks.lib.${system}.run {
             src = ./.;
             hooks = {
@@ -207,7 +216,7 @@
             # would bury the actual verification output under six copies of
             # itself.
             shellHook = ''
-              ${ownRepoOnly preCommit.shellHook}
+              ${ownRepoOnly installGitHooks}
               if [ -t 1 ]; then
                 echo "nim-shm-gset verification shell (pinned)"
                 for t in tlc herd7 genmc nidhugg cdschecker; do
@@ -222,7 +231,7 @@
           # above builds the model checkers, which a hook run never needs.
           pre-commit = pkgs.mkShell {
             packages = [ pkgs.prek ] ++ preCommit.enabledPackages;
-            shellHook = ownRepoOnly preCommit.shellHook;
+            shellHook = ownRepoOnly installGitHooks;
           };
         }
       );
