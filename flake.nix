@@ -103,8 +103,34 @@
             self'.cdschecker
           ];
 
+          # git-hooks.nix installs `.pre-commit-config.yaml` and git hooks into
+          # `git rev-parse --show-toplevel` of the directory the shell is entered
+          # from, so `nix develop /path/to/<this repo>` run inside another checkout
+          # would plant this repository's hooks there. `ownRepoOnly` runs a snippet
+          # only when that toplevel is this repository, recognised by a `flake.nix`
+          # identical to the one this shell was evaluated from; anything it cannot
+          # establish counts as another repository, so it fails safe.
+          # tests/test_dev_shell_writes_nothing_elsewhere.sh
+          ownRepoOnly = script: ''
+            _own_repo_root="$(${pkgs.git}/bin/git rev-parse --show-toplevel 2>/dev/null || true)"
+            if [ -n "$_own_repo_root" ] && [ -f "$_own_repo_root/flake.nix" ] \
+              && [ "$(${pkgs.coreutils}/bin/sha256sum "$_own_repo_root/flake.nix" | ${pkgs.coreutils}/bin/cut -d' ' -f1)" \
+                = "${builtins.hashFile "sha256" ./flake.nix}" ]; then
+            ${script}
+            # git-hooks.nix's installer leaves core.hooksPath as the RELATIVE
+            # `.git/hooks`, in the config every worktree shares. A linked worktree
+            # cannot resolve it (there `.git` is a file), so git silently runs no
+            # hooks there. Point it at the common hooks directory instead.
+            if [ "$(${pkgs.git}/bin/git config --local --get core.hooksPath 2>/dev/null)" = .git/hooks ]; then
+              ${pkgs.git}/bin/git config --local core.hooksPath "$(${pkgs.git}/bin/git rev-parse --path-format=absolute --git-common-dir)/hooks"
+            fi
+            fi
+            unset _own_repo_root
+          '';
+
           # The repo's pre-commit hooks. Entering either shell below writes the
-          # (gitignored) .pre-commit-config.yaml symlink and installs them.
+          # (gitignored) .pre-commit-config.yaml symlink and installs them when
+          # entered from inside this repository (see `ownRepoOnly` above).
           preCommit = git-hooks.lib.${system}.run {
             src = ./.;
             hooks = {
@@ -123,57 +149,62 @@
           # workspace's ambient toolchain is also gcc 15, so this keeps the
           # flake and the ambient shell producing the same result rather than
           # the flake silently losing the TSAN leg of §4.5(g).
-          default = (pkgs.mkShell.override { stdenv = pkgs.gcc15Stdenv; }) {
-            name = "nim-shm-gset-verification";
+          default =
+            (pkgs.mkShell.override {
+              stdenv = if pkgs.stdenv.hostPlatform.isLinux then pkgs.gcc15Stdenv else pkgs.stdenv;
+            })
+              {
+                name = "nim-shm-gset-verification";
 
-            packages = [
-              # Build + functional suite. Same Nim VERSION (2.2.4) the
-              # workspace shell provides, from the pinned nixpkgs.
-              pkgs.nim
-              # nimble is a SEPARATE derivation: nixpkgs' `nim` is a wrapper
-              # that ships nim, nimsuggest, nimpretty, nimgrep and testament,
-              # but NOT nimble. This repo has two test runners — the Justfile
-              # `test` recipe and the `test` task in shm_gset.nimble — and the
-              # campaign's own rule is that a required test must not be
-              # reachable from one runner only. That rule could not be CHECKED
-              # here: nimble was in neither the workspace shell nor this flake,
-              # so `nimble test` exited 127 and the nimble task had only ever
-              # been reviewed by reading it. It is in the shell now so the two
-              # runners can actually be reconciled by running them.
-              pkgs.nimble
-              pkgs.just
-              pkgs.pkg-config
+                packages = [
+                  # Build + functional suite. Same Nim VERSION (2.2.4) the
+                  # workspace shell provides, from the pinned nixpkgs.
+                  pkgs.nim
+                  # nimble is a SEPARATE derivation: nixpkgs' `nim` is a wrapper
+                  # that ships nim, nimsuggest, nimpretty, nimgrep and testament,
+                  # but NOT nimble. This repo has two test runners — the Justfile
+                  # `test` recipe and the `test` task in shm_gset.nimble — and the
+                  # campaign's own rule is that a required test must not be
+                  # reachable from one runner only. That rule could not be CHECKED
+                  # here: nimble was in neither the workspace shell nor this flake,
+                  # so `nimble test` exited 127 and the nimble task had only ever
+                  # been reviewed by reading it. It is in the shell now so the two
+                  # runners can actually be reconciled by running them.
+                  pkgs.nimble
+                  pkgs.just
+                  pkgs.pkg-config
 
-              # §4.5(a) formal tier.
-              pkgs.tlaplus # tlc, tlasany, pcal
+                  # §4.5(a) formal tier.
+                  pkgs.tlaplus # tlc, tlasany, pcal
 
-              # §4.5(g) dynamic tier (previously ambient, now pinned too).
-              pkgs.valgrind
-            ]
-            ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.rr
-            ++ modelCheckers;
+                ]
+                ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+                  pkgs.valgrind
+                  pkgs.rr
+                ]
+                ++ modelCheckers;
 
-            # Only when a human is looking. `just verify-*` runs every recipe
-            # line through `nix develop --command`, and an unconditional banner
-            # would bury the actual verification output under six copies of
-            # itself.
-            shellHook = ''
-              ${preCommit.shellHook}
-              if [ -t 1 ]; then
-                echo "nim-shm-gset verification shell (pinned)"
-                for t in tlc herd7 genmc nidhugg cdschecker; do
-                  printf '  %-11s %s\n' "$t" \
-                    "$(command -v "$t" >/dev/null && echo yes || echo MISSING)"
-                done
-              fi
-            '';
-          };
+                # Only when a human is looking. `just verify-*` runs every recipe
+                # line through `nix develop --command`, and an unconditional banner
+                # would bury the actual verification output under six copies of
+                # itself.
+                shellHook = ''
+                  ${ownRepoOnly preCommit.shellHook}
+                  if [ -t 1 ]; then
+                    echo "nim-shm-gset verification shell (pinned)"
+                    for t in tlc herd7 genmc nidhugg cdschecker; do
+                      printf '  %-11s %s\n' "$t" \
+                        "$(command -v "$t" >/dev/null && echo yes || echo MISSING)"
+                    done
+                  fi
+                '';
+              };
 
           # Just the hooks, for CI's shared lint workflow: the default shell
           # above builds the model checkers, which a hook run never needs.
           pre-commit = pkgs.mkShell {
             packages = [ pkgs.prek ] ++ preCommit.enabledPackages;
-            shellHook = preCommit.shellHook;
+            shellHook = ownRepoOnly preCommit.shellHook;
           };
         }
       );
