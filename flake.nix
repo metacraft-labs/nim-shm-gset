@@ -205,6 +205,9 @@
                   pkgs.nimble
                   pkgs.just
                   pkgs.pkg-config
+                  # Mutation builders and the GenMC failure classifier must
+                  # also work when no interpreter is inherited from the host.
+                  pkgs.perl
 
                   # §4.5(a) formal tier.
                   pkgs.tlaplus # tlc, tlasany, pcal

@@ -1,0 +1,15 @@
+AArch64 generation-publication
+(* Successful acq_rel compare/exchange lowers to LDAXR/STLXR; the consumer
+ * acquires the published policy word before reading preceding producer data.
+ * The actual C unit, all branches included, is checked under GenMC/RC11. *)
+{
+0:X1=payload; 0:X2=word;
+1:X1=word; 1:X2=payload;
+}
+ P0                | P1           ;
+ MOV W0,#42        | LDAR W0,[X1] ;
+ STR W0,[X1]       | LDR W1,[X2]  ;
+ LDAXR W3,[X2]     |              ;
+ MOV W4,#1         |              ;
+ STLXR W5,W4,[X2]  |              ;
+exists (1:X0=1 /\ 1:X1=0)

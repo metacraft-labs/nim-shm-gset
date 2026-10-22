@@ -102,6 +102,7 @@ test: check-runner-parity
     nim c -r {{nim_flags}} tests/test_shm_gset_platform.nim
     nim c -r {{nim_flags}} tests/test_shm_gset.nim
     nim c -r {{nim_flags}} tests/test_shm_gset_transport.nim
+    nim c -r {{nim_flags}} -d:shmGSetScheduleHooks tests/test_generation_publisher.nim
     nim c -r {{nim_flags}} tests/test_shm_gset_lf5.nim
     # Reaper identity: runId lives in the shard HEADER, not the file name —
     # header attribution, appId scoping, both staleness axes, and migration of a
@@ -359,7 +360,7 @@ verify-aarch64:
         verification/core/build-aarch64-qemu.sh
 
 # The whole §4.5 formal / weak-memory tier, in dependency order.
-verify: verify-tla verify-core verify-litmus verify-models verify-cdschecker verify-aarch64
+verify: verify-tla verify-core verify-litmus verify-models verify-cdschecker verify-aarch64 verify-generation-publisher verify-publisher-ownership
 
 # rr chaos-mode record + deterministic replay of the multi-process fork oracle
 # (design spec §4.5(f)). Explores rare fork/grow interleavings under a randomised
@@ -380,3 +381,13 @@ bench:
 # Runs `nix develop`, so it is not part of the in-shell test recipes.
 test-dev-shell:
     bash tests/test_dev_shell_writes_nothing_elsewhere.sh
+
+# Focused publication unit: actual shipped C under RC11 and native sanitizers,
+# with release-order and monotonicity mutations required to fail.
+verify-generation-publisher:
+    {{verify_shell}} bash verification/run-generation-publisher.sh
+
+# Nim ownership controls use disposable source copies and reject only assertion
+# failures; an unexpected compiler/tool error never counts as sensitivity.
+verify-publisher-ownership:
+    {{verify_shell}} bash verification/check-publisher-ownership-mutations.sh

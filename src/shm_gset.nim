@@ -2112,3 +2112,5 @@ else:
   proc shards0Base*[K](s: ShmGSetT[K]): pointer = nil
   proc reapStaleSegmentsDetailed*(dir, appId: string): seq[ReapedSegment] = @[]
   proc reapStaleSegments*(dir, appId: string): int = 0
+
+include shm_gset/generation_publisher_impl

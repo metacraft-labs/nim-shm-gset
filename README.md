@@ -136,6 +136,64 @@ echo s.shardCount(), s.growthFailures()  # metrics; growthFailures>0 ⇒ mcIncom
 
 ## Reset and recycling
 
+### Typed transport and prepared generation publication
+
+`SetHostT[K]` and `SetProducerT[K]` carry a custom key policy through the
+transport lifecycle. Create with `startHostT(dir, runId, K)`, attach with
+`attachProducerT(path0, K)`, and use the existing read/emit/reset/finish methods.
+`SetHost` and `SetProducer` remain aliases for `IdentityKey`; the default pool
+and default shard bytes are unchanged. `readPolicyWord(index)` on a typed host
+returns a checked status plus the acquire-read generation and word. Serialize
+host reset/finalization with reads, as with snapshots.
+
+Copies of ordinary handles share the mapping lifetime and do not create
+independent producer registrations. After one copy detaches, other aliases
+must not be used or detached. Use a separate attachment for an independent
+lifetime; the publisher owner below creates one internally.
+
+For a policy that reserves a control word, `shm_gset/generation_publisher`
+provides a separate, move-only owner:
+
+```nim
+var storage: PreparedGenerationPublisher # zero-initialized, stable address
+var publisher = openGenerationPublisher(host.path0, MyPolicy, 0, storage)
+if publisher.available:
+  let status = publishPreparedGeneration(addr storage)
+  # gpsPublished / gpsAlreadyPublished record the captured generation.
+publisher.close()
+```
+
+The owner privately attaches and registers against the same existing anchor;
+it borrows nothing from an ordinary producer and exposes no insertion or raw
+mapping. Moving the owner preserves its binding. Copying is a compile error.
+Closing it disarms storage before deregistering and unmapping; repeat close is
+safe, and the same storage can then be bound again. A second live or racing
+binding is refused without disturbing the first owner. Partial preparation
+failure releases its attachment and storage claim.
+
+Storage must outlive the owner and stay at the same address until close
+completes. Never copy or reinitialize live storage. C consumers use
+`generation_publisher.h` and `SHM_GSET_GENERATION_PUBLISHER_INIT` (or static
+zero initialization). Open/close/destruction require publication quiescence;
+this is not a concurrent-unmap protocol. Publication itself is concurrent and
+reentrant, uses only lock-free atomic operations in the library's C unit, and
+does not call Nim, access TLS/errno, allocate, perform I/O or resolve symbols.
+Unsupported atomic targets refuse preparation.
+
+Publication returns distinct unavailable, consumer-gone, stale-generation and
+invalid-state outcomes. A success records the captured generation as observed
+by the final acquire, not a guarantee against reset after return. Production
+registration prevents reset while the owning process remains attached. Even a
+delayed old-generation CAS cannot erase a newer mark or turn an old mark into
+a current one. Reset never clears policy words: the consumer interprets a
+word equal to its generation as marked, a smaller word as historical, and a
+greater word as invalid metadata. Generation exhaustion still refuses reset.
+
+After a private-address-space fork, a recycling consumer must close the
+inherited owner and reopen before the child publishes. Child close preserves
+the parent's registration. Inheritance alone does not register the child's PID
+and cannot prevent reset once the original producer dies.
+
 **Status: IMPLEMENTED (`reset` + the host-side pool, `shm_gset/pool`).**
 Motivated by hosting the monitor
 in-process (`reprobuild-specs/In-Process-Monitor-Hosting.md`): a long-lived

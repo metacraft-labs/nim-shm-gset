@@ -8,6 +8,7 @@ nimcache/
 tests/test_shm_gset
 tests/test_shm_gset_hooks
 tests/test_shm_gset_transport
+tests/test_generation_publisher
 tests/test_shm_gset_lf5
 tests/test_shm_gset_reaper_identity
 tests/test_shm_gset_reset
@@ -21,6 +22,7 @@ tests/test_shm_gset_keyed_concurrency
 tests/test_shm_gset_pool
 tests/test_nimcache_is_worktree_local
 tests/helpers/lease_copy_probe
+tests/helpers/publisher_copy_probe
 tests/helpers/pool_lifecycle_probe
 benchmarks/bench_transports
 # TLC model-checker scratch (state graph, translation backups)

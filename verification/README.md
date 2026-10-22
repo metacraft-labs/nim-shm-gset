@@ -13,6 +13,79 @@ alone give false confidence; hence this tier.
 
 ## Every `just verify-*` tool is PINNED by this repo's own flake
 
+The prepared-generation publisher has focused gates:
+
+```sh
+just verify-generation-publisher
+just verify-publisher-ownership
+nix develop . --command nim c -r --hints:off --threads:on --path:src --path:tests \
+  -d:shmGSetScheduleHooks tests/test_generation_publisher.nim
+```
+
+The default verification shell supplies Perl for the mutation builders and
+failure classifier, alongside the compiler and model checkers. To verify the
+entry point without inheriting host tools, enter from outside the checkout:
+
+```sh
+cd /tmp
+nix develop /path/to/nim-shm-gset --ignore-environment --command \
+  bash /path/to/nim-shm-gset/verification/run-generation-publisher.sh
+```
+
+`core/generation_publisher_driver.c` includes the actual shipped
+`src/shm_gset/generation_publisher.c`; it does not transcribe the algorithm.
+Seven finite workloads cover publication/reader ordering, concurrent publishers,
+forced reset, competing storage claims, and both delayed old-generation CAS
+boundaries (an old mark remaining historical and a newer mark resisting an
+old CAS), plus concurrent arm versus publication of the prepared pointers and
+captured generation. Production registration excludes those forced resets;
+the forced workloads test monotonicity and status reporting independently of that
+exclusion. The existing reset model and the real raw/typed-host refusal tests
+cover the unchanged registration/seal handshake.
+
+The runner explicitly selects **RC11** and disables GenMC's automatic model
+detector so it cannot substitute RA on the binding/contention workloads.
+`-fno-builtin` prevents LLVM from synthesizing a cold-path `memset` that
+GenMC 0.17 traps while promoting; no atomic or assertion is suppressed. The
+same unit also runs natively under ASan/UBSan and TSAN. Six disposable source
+mutations must produce `Error: Safety violation!`: remove the release edge,
+replace monotonic CAS with store, omit the mark, permit rebinding, omit disarm,
+or omit the final generation observation. A seventh removes the ARMED readiness
+release and must produce `Error: Non-atomic race!` on prepared-field publication.
+A compiler error or tool crash is not an accepted negative control. Source and
+patch hashes accompany the logs.
+`classify-generation-publisher-failure.pl` requires GenMC's violation exit status
+and the actual reported error event at the control's named assertion oracle;
+line numbers are derived from markers on the assertions. For readiness it
+requires the reported conflicting events to be the non-atomic write and read
+of `first.captured`, at the two exact production statements, with locations
+derived from the source. Prepared accesses elsewhere in the graph do not count.
+Four real GenMC controls fail at an unrelated assertion or race, both without
+publication and after successful publication. Every classifier must reject all
+four. The after-publication race trace deliberately includes `first.captured`
+accesses at the readiness mutant's exact source sites, but its reported conflict
+is on unrelated data. These controls guard the classifier itself against
+accepting the wrong failure. The primary workload assertions are unchanged.
+The optimized production object must have no undefined symbols; a separate
+compile exercises the unsupported-atomics branch without a libatomic fallback.
+
+The Nim suite covers real mappings, producer death, independent attachments,
+policy skew both ways, move/copy behavior, racing opens, failed-open cleanup,
+and close/reset ordering. Linux additionally checks the actual mapping count
+after repeated partial failures. Two POSIX-only tests cover inherited-owner
+close/reopen and the fact that an inherited registration does not keep a chain
+busy after its original producer dies. The ownership mutation runner checks
+that leaking the attachment and allowing owner copies fail their respective
+assertions, after a clean control run in the same disposable source tree.
+`Justfile` and Nimble register the same suite with the schedule-hook flag.
+
+`litmus/generation-publication*.litmus` checks the successful CAS/acquire-reader
+pair under four C11 models; its AArch64 companions check LDAXR/STLXR against
+LDXR/STXR controls under the ARMv8 model. Formal ARM evidence is not native
+ARM64 qualification. These focused gates target Linux x86-64 and do not
+qualify macOS, Windows or native ARM execution. The older result tables below
+describe their original measured baselines, not this new suite's total.
+
 Until 2026-08-21 the tools in this directory were pulled ad hoc with
 `nix shell nixpkgs#tlaplus` / `nix shell nixpkgs#pkgsCross...`, which resolves
 through the machine's mutable **flake registry** — whatever nixpkgs that
