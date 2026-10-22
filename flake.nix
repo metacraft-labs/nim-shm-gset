@@ -159,10 +159,10 @@
             unset _own_repo_root
           '';
 
-          # The flake's hook set, run by `nix flake check`. Entering either shell
-          # below installs the committed .pre-commit-config.yaml as the git hook,
-          # with this set's pre-commit, when entered from inside this repository
-          # (see `installGitHooks` and `ownRepoOnly` above).
+          # git-hooks.nix supplies tools for the committed hook configuration.
+          # Run it through the installed hook or with
+          # `nix develop .#pre-commit --command prek run --all-files`.
+          # This flake exports no checks output.
           preCommit = git-hooks.lib.${system}.run {
             src = ./.;
             hooks = {
