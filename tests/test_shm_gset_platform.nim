@@ -20,6 +20,8 @@
 ## Run under both runners like every other file here.
 
 import std/[os, strutils, unittest]
+when not defined(windows):
+  import std/posix
 import shm_gset
 import shm_gset/platform
 import ./xproc
@@ -73,7 +75,64 @@ xprocChildEntry()
 
 # ---------------------------------------------------------------------------
 
+when not defined(windows):
+  proc allocatedBytes(path: string): int64 =
+    ## Bytes of storage the filesystem has actually backed `path` with
+    ## (`st_blocks` is in 512-byte units everywhere POSIX), as opposed to its
+    ## length. The two differ exactly when the tail is sparse.
+    var st: Stat
+    doAssert stat(path.cstring, st) == 0, "stat failed for " & path
+    int64(st.st_blocks) * 512
+
+  proc backedDir(tag: string): string =
+    ## A directory on a filesystem that keeps an un-written tail SPARSE and reports
+    ## allocation faithfully through `st_blocks`, so the property below is
+    ## observable. tmpfs (`/dev/shm`) is that filesystem on Linux and is also the
+    ## one the defect was measured on; elsewhere the default temp dir is used.
+    when defined(linux):
+      if dirExists("/dev/shm"):
+        inc tmpCtr
+        result = "/dev/shm" / ("shmgset-plat-" & tag & "-" & $getCurrentProcessId() & "-" & $tmpCtr)
+        removeDir(result)
+        try:
+          createDir(result)
+          return
+        except CatchableError:
+          discard
+    result = freshDir(tag)
+
 suite "the mapping contract":
+
+  when not defined(windows):
+    test "a sized shard file is backed with storage, not left sparse":
+      # WHY THIS IS A CONTRACT AND NOT A DETAIL. The library writes its header
+      # through a MAP_SHARED mapping of a file it has just sized. If the size is
+      # only a recorded length (`ftruncate` on a sparse-capable filesystem), the
+      # pages are allocated on first write, and when the filesystem is full that
+      # allocation fails INSIDE the store instruction: the kernel delivers SIGBUS,
+      # not an error code. On rpi2 (2026-10-30) that killed io-mon's monitor root
+      # in `initShardHeader` roughly one cold run in five while `/tmp` was full,
+      # leaving an all-zero shard0 temp file of exactly the right length. Backing
+      # the file in `setFileSize` moves the failure to where it is a return value.
+      #
+      # The property is measured, not assumed: a plain `ftruncate`d file in the
+      # same directory is the NEGATIVE CONTROL — if it did not read as sparse, the
+      # filesystem could not tell the two apart and the assertion would be vacuous.
+      let dir = backedDir("backed")
+      defer: removeDir(dir)
+      let sparse = dir / "sparse.bin"
+      let f0 = openNewExclusive(sparse)
+      doAssert f0.isValid
+      doAssert ftruncate(cint(f0), Off(Sz)) == 0
+      closeFile(f0)
+      if allocatedBytes(sparse) >= Sz:
+        skip()   # this filesystem allocates eagerly; nothing to distinguish here
+      else:
+        let backed = dir / "backed.bin"
+        let f = makeSized(backed, Sz)
+        closeFile(f)
+        check getFileSize(backed) == Sz
+        check allocatedBytes(backed) >= Sz          # PRIMARY ASSERTION
 
   test "a mapped view outlives the descriptor it was made from":
     # This is what lets `openShard` close its descriptor the moment the shard is
