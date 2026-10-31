@@ -55,7 +55,8 @@
 ## ==========================================  ==========================================
 ## `open(p, O_RDWR|O_CREAT|O_EXCL, 0600)`      `CreateFileW(.., CREATE_NEW)`
 ## `open(p, O_RDWR)` / `O_RDONLY`              `CreateFileW(.., OPEN_EXISTING)`
-## `ftruncate(fd, n)`                          `SetFilePointerEx` + `SetEndOfFile`
+## `posix_fallocate(fd, 0, n)` (backed, not     `SetFilePointerEx` + `SetEndOfFile`
+##   sparse — see `setFileSize`)                  (NTFS allocates the extension eagerly)
 ## `mmap(nil, n, RW, MAP_SHARED, fd, 0)`       `CreateFileMappingW` + `MapViewOfFileEx`
 ## `mmap(a, .., MAP_FIXED, ..)` (test-only)    `MapViewOfFileEx(.., a)`
 ## `munmap(p, n)`                              `UnmapViewOfFile(p)` (length implicit)
@@ -368,7 +369,36 @@ elif shmGSetPlatformSupported:
   proc lastOpenFailedBecauseItExists*(): bool = errno == EEXIST
 
   proc setFileSize*(f: ShmFile; size: int): bool =
-    ftruncate(cint(f), Off(size)) == 0
+    ## Size a fresh shard file AND back every byte of it with storage, so that
+    ## the first write through the shared mapping cannot fault.
+    ##
+    ## `ftruncate` alone is not enough. It only records the length: on tmpfs
+    ## (where io-mon's fragment directory lives, `/tmp`) and on any filesystem
+    ## that keeps the tail sparse, no page is allocated until it is first
+    ## written — and a write through a `MAP_SHARED` mapping that cannot be
+    ## backed because the filesystem is FULL is not reported as an error, it is
+    ## delivered as **SIGBUS**. Measured on rpi2 (Raspberry Pi OS 13 armhf,
+    ## 2026-10-30): with `/tmp` at 100%, `ftruncate` + `mmap` + the first header
+    ## store in `initShardHeader` killed `reprobuild internal io monitor` with
+    ## SIGBUS, leaving an all-zero, correctly sized `.shard0.tmp.<pid>` behind;
+    ## the same sequence through `posix_fallocate` fails cleanly with ENOSPC. So
+    ## the allocation is made HERE, where a failure is still a return value the
+    ## caller turns into "set unavailable" (and io-mon into a reported loss),
+    ## instead of a crash of the monitored tree's root.
+    ##
+    ## `posix_fallocate` is the portable spelling: Linux implements it with
+    ## `fallocate(2)` where the filesystem supports it and glibc falls back to
+    ## writing zeros where it does not; Nim's `std/posix` emulates it on macOS
+    ## with `F_PREALLOCATE` + `ftruncate`. It returns the errno rather than
+    ## setting it. A filesystem that reports EOPNOTSUPP/EINVAL for the
+    ## allocation itself still gets the length set, so a platform without
+    ## preallocation degrades to the previous behaviour rather than refusing to
+    ## create shards at all.
+    let rc = posix_fallocate(cint(f), Off(0), Off(size))
+    if rc == 0: return true
+    if rc == EOPNOTSUPP or rc == EINVAL:
+      return ftruncate(cint(f), Off(size)) == 0
+    false
 
   proc readSome*(f: ShmFile; buf: pointer; n: int): int =
     read(cint(f), buf, n)

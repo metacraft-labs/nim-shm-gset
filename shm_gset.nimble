@@ -48,6 +48,7 @@ task test, "Build + run the nim-shm-gset test suite":
   # cannot be attached, `emOversize` past the cap). These are REQUIRED
   # lossless-capture gates and were reachable from the Justfile only.
   exec "nim c -r " & testFlags & " tests/test_shm_gset_transport.nim"
+  exec "nim c -r " & testFlags & " -d:shmGSetScheduleHooks tests/test_generation_publisher.nim"
   # LF-5 (oversize is not loss): an element larger than a shard's arena is
   # captured by GROWTH, and a genuinely impossible allocation surfaces as
   # SIGNALLED saturation rather than a silent drop. Also Justfile-only until now.

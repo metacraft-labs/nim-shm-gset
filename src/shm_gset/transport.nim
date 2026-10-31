@@ -18,7 +18,7 @@
 ## element key/value codec is io-mon's Layer 2/3, above this surface.
 
 import ../shm_gset
-export shm_gset.ShmGSet   # transports may hand back the raw view when useful
+export shm_gset.ShmGSet, shm_gset.IdentityKey
 export shm_gset.AttachFailure, shm_gset.ResetStatus
 export shm_gset.ShmGSetLayoutRevision, shm_gset.shardLayoutRevision
 
@@ -33,30 +33,34 @@ type
     emSaturated    ## growth itself failed (OOM): SIGNALLED, never a silent drop
     emUnavailable  ## not attached (LF-2 fail-fast / portable no-op arm)
 
-  SetProducer* = object
+  SetProducerT*[K] = object
     ## Producer-side handle over an attached shard chain.
-    s: ShmGSet
+    s: ShmGSetT[K]
     maxElementBytes: int   ## 0 == unlimited; the SET's growth absorbs oversize
                            ## (LF-5), so a nonzero cap is only for a transport
                            ## that genuinely cannot frame an element.
 
-  SetHost* = object
+  SetHostT*[K] = object
     ## Consumer/host-side lifecycle owner (create → path0 → snapshot → detach).
-    s: ShmGSet
+    s: ShmGSetT[K]
+
+  SetProducer* = SetProducerT[IdentityKey]
+  SetHost* = SetHostT[IdentityKey]
 
 # --- producer side ----------------------------------------------------------
 
-proc attachProducer*(path0: string; maxElementBytes = 0): SetProducer =
+proc attachProducerT*[K](path0: string; policy: typedesc[K];
+    maxElementBytes = 0): SetProducerT[K] =
   ## Attach a producer to a host-created chain via shard0's well-known path
   ## (`REPRO_MONITOR_DEP_SHM`). `maxElementBytes = 0` means unlimited (the SET
   ## grows to fit any element); a nonzero cap makes `emit` report `emOversize`
   ## for elements it must refuse — the `mcIncomplete` path.
   result.maxElementBytes = maxElementBytes
-  result.s = attachSet(path0)
+  result.s = attachSetT(path0, K)
 
-proc available*(p: SetProducer): bool = p.s.available
+proc available*[K](p: SetProducerT[K]): bool = p.s.available
 
-proc attachFailure*(p: SetProducer): AttachFailure = p.s.attachFailure
+proc attachFailure*[K](p: SetProducerT[K]): AttachFailure = p.s.attachFailure
   ## WHY this producer is unavailable, when it is. Deliberately a QUERY rather
   ## than a new `EmitStatus` value: `EmitStatus` is matched exhaustively by
   ## consumers (io-mon's `writer.nim` and `fs_snoop.nim` both `case` over it
@@ -71,7 +75,7 @@ proc attachFailure*(p: SetProducer): AttachFailure = p.s.attachFailure
   ## binary in the deployment was not rebuilt. Pair it with `shardLayoutRevision
   ## (path0)` versus `ShmGSetLayoutRevision` for the two revision numbers.
 
-proc emit*(p: var SetProducer; blob: openArray[byte]): EmitStatus =
+proc emit*[K](p: var SetProducerT[K]; blob: openArray[byte]): EmitStatus =
   ## Idempotent, non-blocking, serialization-free insert. Maps the SET's insert
   ## outcome onto the transport-agnostic `EmitStatus`. A re-observed element is a
   ## single CAS that finds it present (`emExists`), so backpressure never arises.
@@ -86,61 +90,62 @@ proc emit*(p: var SetProducer; blob: openArray[byte]): EmitStatus =
   of isSaturated: emSaturated
   of isUnavailable: emUnavailable
 
-proc detach*(p: var SetProducer) = p.s.detach()
+proc detach*[K](p: var SetProducerT[K]) = p.s.detach()
 
 # --- consumer / host side ---------------------------------------------------
 
-proc startHost*(dir, runId: string; appId = "io-mon"; shard0Cap = 1024;
-    shard0ArenaCap = 256 * 1024): SetHost =
+proc startHostT*[K](dir, runId: string; policy: typedesc[K];
+    appId = "io-mon"; shard0Cap = 1024;
+    shard0ArenaCap = 256 * 1024): SetHostT[K] =
   ## Create shard0 (the well-known anchor) and register this process as the live
   ## consumer. Hand `path0` to producers via `REPRO_MONITOR_DEP_SHM`. `appId`
   ## scopes the cross-restart reaper so one app never reaps another's segments
   ## (defaults to `"io-mon"`; a different consumer, e.g. reprobuild/codetracer,
   ## passes its own tag).
-  result.s = createSet(dir, appId, runId, shard0Cap = shard0Cap,
+  result.s = createSetT(dir, appId, runId, K, shard0Cap = shard0Cap,
     shard0ArenaCap = shard0ArenaCap)
 
-proc available*(h: SetHost): bool = h.s.available
-proc path0*(h: SetHost): string = h.s.path0
-proc runId*(h: SetHost): string = h.s.runId
+proc available*[K](h: SetHostT[K]): bool = h.s.available
+proc path0*[K](h: SetHostT[K]): string = h.s.path0
+proc runId*[K](h: SetHostT[K]): string = h.s.runId
   ## The chain's run identity, read back from shard0's HEADER (never from the
   ## file name). A host that recycles a chain re-stamps this field, so it — not
   ## the anchor's name — is what any consumer or reaper attributes evidence to.
 
-iterator items*(h: var SetHost): seq[byte] =
+iterator items*[K](h: var SetHostT[K]): seq[byte] =
   ## Single-threaded merged distinct set (the depfile source of truth, §4.3.3).
   for e in h.s.items: yield e
 
-proc snapshot*(h: var SetHost): seq[seq[byte]] = h.s.snapshot()
-proc growthFailures*(h: var SetHost): uint64 = h.s.growthFailures()
-proc shardCount*(h: var SetHost): int = h.s.shardCount()
-proc claimedSlots*(h: var SetHost): uint64 = h.s.claimedSlots()
+proc snapshot*[K](h: var SetHostT[K]): seq[seq[byte]] = h.s.snapshot()
+proc growthFailures*[K](h: var SetHostT[K]): uint64 = h.s.growthFailures()
+proc shardCount*[K](h: var SetHostT[K]): int = h.s.shardCount()
+proc claimedSlots*[K](h: var SetHostT[K]): uint64 = h.s.claimedSlots()
 
-proc generation*(h: SetHost): uint64 = h.s.generation
+proc generation*[K](h: SetHostT[K]): uint64 = h.s.generation
   ## The chain's generation: 1 when created, one more per successful `reset`.
 
-proc attachedProducers*(h: SetHost): int = h.s.attachedProducers
+proc attachedProducers*[K](h: SetHostT[K]): int = h.s.attachedProducers
   ## Producers that could still be mid-insert — the predicate `reset` refuses
   ## on, exposed so a pool can ask before trying.
 
-proc untrackedProducers*(h: SetHost): int = h.s.untrackedProducers
+proc untrackedProducers*[K](h: SetHostT[K]): int = h.s.untrackedProducers
   ## Of those, how many attached when the producer registry was full. Nonzero is
   ## what makes a refusal possibly PERMANENT (`rsProducersUntracked`) rather
   ## than transient, so a pool should retire the chain instead of retrying it.
 
-proc producerAttaches*(h: SetHost): uint64 = h.s.producerAttaches
+proc producerAttaches*[K](h: SetHostT[K]): uint64 = h.s.producerAttaches
   ## Producers that successfully attached under the current generation. Zero
   ## alongside an empty set, for an action that spawned processes, is the
   ## fingerprint of a version-skewed producer — see `shm_gset.producerAttaches`.
 
-proc markConsumerGone*(h: var SetHost) =
+proc markConsumerGone*[K](h: var SetHostT[K]) =
   ## End the ACTION without ending the host: late producers fast-fail with
   ## `emConsumerGone`, but the chain stays mapped and recyclable. This is the
   ## first half of what `finish` does, split out because recycling needs the
   ## quiesce without the teardown.
   h.s.markConsumerGone()
 
-proc reset*(h: var SetHost; runId: string): ResetStatus =
+proc reset*[K](h: var SetHostT[K]; runId: string): ResetStatus =
   ## Recycle this chain into a FRESH empty set, reusing the mapped shards, and
   ## re-stamp it with `runId`. Consumer-only. Requires quiescence.
   ##
@@ -153,14 +158,14 @@ proc reset*(h: var SetHost; runId: string): ResetStatus =
   h.s.reset(runId)
 
 when shmGSetSupported and defined(shmGSetScheduleHooks):
-  proc forceGenerationForTest*(h: var SetHost; g: uint64) =
+  proc forceGenerationForTest*[K](h: var SetHostT[K]; g: uint64) =
     ## TEST-ONLY seam (`-d:shmGSetScheduleHooks`), the host-side pass-through of
     ## `shm_gset.forceGenerationForTest`. It exists so the recycling POOL's
     ## `rsGenerationExhausted` policy is reachable in a test instead of after
     ## 4.29e9 real recycles. Compile-time gated, so it cannot ship.
     h.s.forceGenerationForTest(g)
 
-proc finish*(h: var SetHost) =
+proc finish*[K](h: var SetHostT[K]) =
   ## End the host lifecycle: announce the consumer is gone (so any late producer
   ## `emit` fast-fails with `emConsumerGone`), then unmap. Terminal for THIS
   ## handle — but no longer terminal for the CHAIN: `reset` re-arms the liveness
@@ -168,3 +173,32 @@ proc finish*(h: var SetHost) =
   ## it is still mapped, i.e. `markConsumerGone` was used rather than `finish`).
   h.s.markConsumerGone()
   h.s.detach()
+
+proc attachProducer*(path0: string; maxElementBytes = 0): SetProducer =
+  ## Default-policy attachment; its lifecycle and copy semantics are unchanged.
+  attachProducerT(path0, IdentityKey, maxElementBytes)
+
+proc startHost*(dir, runId: string; appId = "io-mon"; shard0Cap = 1024;
+    shard0ArenaCap = 256 * 1024): SetHost =
+  ## Default-policy host, also used by the unchanged default pool.
+  startHostT(dir, runId, IdentityKey, appId, shard0Cap, shard0ArenaCap)
+
+type
+  PolicyWordReadStatus* = enum
+    pwrRead, pwrUnavailable, pwrInvalidWord
+  PolicyWordRead* = object
+    status*: PolicyWordReadStatus
+    generation*: uint64
+    value*: uint64
+
+proc readPolicyWord*[K](h: var SetHostT[K]; word: int): PolicyWordRead =
+  ## Checked acquire read. Serialize host reset/finalization with this read,
+  ## just as with snapshot. A zero value is not an attachment failure.
+  mixin extraControlWords
+  if word < 0 or word >= extraControlWords(K):
+    return PolicyWordRead(status: pwrInvalidWord)
+  if not h.s.available:
+    return PolicyWordRead(status: pwrUnavailable)
+  result.status = pwrRead
+  result.generation = h.s.generation
+  result.value = h.s.controlWord(word)
