@@ -121,8 +121,13 @@ suite now runs NATIVELY ON WINDOWS as well, so the count is per-platform:
 
 | platform | `[OK]` | `[FAILED]` | `[SKIPPED]` | not-applicable |
 |---|---|---|---|---|
-| Linux x86-64 | 114 | 0 | 0 | 0 |
-| Windows x86-64 | 112 | 0 | 0 | 3 |
+| Linux x86-64 (re-measured 2026-11-09) | 136 | 0 | 0 | 0 |
+| Windows x86-64 (2026-09-14, not re-measured since) | 112 | 0 | 0 | 3 |
+
+The Linux count was already 130 before the six `emitNoGrow` cases were added,
+so the reconciliation below describes the 2026-09-14 counts only. The
+signal-handler case is POSIX-only and is declared with `notApplicableHere` on
+Windows.
 
 They reconcile exactly: three cases assert POSIX process semantics with no
 Windows counterpart (a `fork` child holding an inherited `ptr SetPool`, twice,

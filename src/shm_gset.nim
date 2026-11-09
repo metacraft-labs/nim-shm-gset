@@ -565,6 +565,13 @@ when shmGSetSupported:
                                 ## was full — counted in `ShOffProducerOverflow`),
                                 ## -2 == not a registered producer at all
                                 ## (a consumer view, or never attached)
+      noGrowShard0: ShardMap    ## shard0's mapping, copied once a producer
+                                ## attach succeeds, for `insertNoGrow`. A plain
+                                ## field, not `shards[0]`: `shards` is a seq
+                                ## that `openShard` may reallocate, and a signal
+                                ## handler must never read through it.
+      noGrowReady: bool         ## (atomic) `noGrowShard0` is valid. Set after
+                                ## the copy, cleared before `detach` unmaps.
 
     ShmGSet* = ShmGSetT[IdentityKey]
       ## The io-mon instantiation: key ≡ element. Same type, same layout, same
@@ -1355,6 +1362,8 @@ when shmGSetSupported:
         return
       yieldThread()
     bumpGenStamped(b, ShOffProducerAttaches, headerGeneration(b), 1)
+    result.noGrowShard0 = result.shards[0]
+    atomicStoreN(addr result.noGrowReady, true, ATOMIC_RELEASE)
     result.failure = afNone
     result.available = true
 
@@ -1369,6 +1378,9 @@ when shmGSetSupported:
     if s.available: afNone else: s.failure
 
   proc detach*[K](s: var ShmGSetT[K]) =
+    # First, so an `insertNoGrow` from a signal handler that interrupts this
+    # detach finds the view unavailable instead of an unmapped shard.
+    atomicStoreN(addr s.noGrowReady, false, ATOMIC_RELEASE)
     if s.producerSlot != -2 and s.shards.len > 0 and not s.shards[0].base.isNil:
       unregisterProducer(s.shards[0].base, s.producerSlot, s.producerPid)
     s.producerSlot = -2
@@ -1427,6 +1439,51 @@ when shmGSetSupported:
         if not growNewest(s, n, s.shards[newestIdx], gen):
           return isSaturated
         # loop: retry into the (now) newest shard — never drop.
+
+  proc insertNoGrow*[K](s: var ShmGSetT[K]; blob: openArray[byte]): InsertStatus =
+    ## ASYNC-SIGNAL-SAFE insert, for a producer that must publish one element
+    ## from a context where `insert` is not allowed to run: a signal handler,
+    ## or a process with no file descriptor left. `insert` may have to map or
+    ## create a shard (strings, a seq resize, file creation), and none of that
+    ## is safe there. This call never does.
+    ##
+    ## It touches only shard0, through the mapping copied when the producer
+    ## attached, so it reads no seq, allocates nothing, takes no lock, opens no
+    ## file and makes no system call. The insert itself is the same lock-free
+    ## slot claim as `insert`: an arena reserve by CAS, a copy, a publish CAS.
+    ## A signal that interrupts a half-done insert on its own thread races it
+    ## as one more producer would. Shard0 is never unmapped while the view is
+    ## attached, and every reader unions all shards, so an element placed in
+    ## shard0 after the chain has grown is read like any other.
+    ##
+    ## When shard0 cannot take the element (its table or arena is full for this
+    ## generation, or a flattener drained it), the call does not grow the
+    ## chain. It bumps shard0's growth-failure counter instead (one CAS loop on
+    ## mapped memory) and returns `isSaturated`. A consumer already grades a
+    ## chain with `growthFailures() > 0` incomplete, so the evidence is never
+    ## dropped silently. That counter then also counts "an element could not be
+    ## published without growing", not only an OOM growth failure. Both mean the
+    ## set is missing an element its producer had.
+    ##
+    ## Returns `isInserted` / `isExists` when the element is in shard0,
+    ## `isSaturated` after bumping the counter, and `isUnavailable` when the
+    ## view is not an attached producer (never attached, or detached).
+    mixin primaryKeySpan, hashKey, identityFp
+    if not atomicLoadN(addr s.noGrowReady, ATOMIC_ACQUIRE): return isUnavailable
+    var sm = s.noGrowShard0
+    if sm.base.isNil: return isUnavailable
+    let gen = headerGeneration(sm.base)
+    if gen == GenerationNone: return isUnavailable
+    if not sm.isDrained:
+      let span = primaryKeySpan(K, blob)
+      let keyHash = hashKey(K, blob.toOpenArray(span.a, span.b))
+      let ifp = identityFp(K, blob, keyHash)
+      case insertIntoShard(K, sm, blob, keyHash, ifp, gen)
+      of siInserted: return isInserted
+      of siExists: return isExists
+      of siNeedGrow: discard
+    bumpGenStamped(sm.base, ShOffGrowthFailed, gen, 1)
+    isSaturated
 
   proc contains*[K](s: var ShmGSetT[K]; blob: openArray[byte]): bool =
     ## Identity membership across the whole chain (probing, no mutation). For the
@@ -2081,6 +2138,8 @@ else:
   proc detach*[K](s: var ShmGSetT[K]) = discard
   proc elementKeyHash*[K](s: ShmGSetT[K]; blob: openArray[byte]): uint64 = 0
   proc insert*[K](s: var ShmGSetT[K]; blob: openArray[byte]): InsertStatus =
+    isUnavailable
+  proc insertNoGrow*[K](s: var ShmGSetT[K]; blob: openArray[byte]): InsertStatus =
     isUnavailable
   proc contains*[K](s: var ShmGSetT[K]; blob: openArray[byte]): bool = false
   iterator withPrimaryKeyHash*[K](s: var ShmGSetT[K]; keyHash: uint64): ElemView =

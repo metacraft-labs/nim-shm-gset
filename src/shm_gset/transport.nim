@@ -90,6 +90,22 @@ proc emit*[K](p: var SetProducerT[K]; blob: openArray[byte]): EmitStatus =
   of isSaturated: emSaturated
   of isUnavailable: emUnavailable
 
+proc emitNoGrow*[K](p: var SetProducerT[K]; blob: openArray[byte]): EmitStatus =
+  ## Async-signal-safe `emit` that never grows the chain (see `insertNoGrow`),
+  ## for a producer that publishes one pre-encoded element from a signal
+  ## handler or with no file descriptor left. When shard0 cannot take the
+  ## element, it bumps the growth-failure counter and returns `emSaturated`,
+  ## which a consumer grades incomplete exactly like a failed growth. It skips
+  ## `emit`'s consumer-liveness check: an element published after the consumer
+  ## left is harmless, and this path stays minimal.
+  if p.maxElementBytes > 0 and blob.len > p.maxElementBytes:
+    return emOversize
+  case p.s.insertNoGrow(blob)
+  of isInserted: emInserted
+  of isExists: emExists
+  of isSaturated: emSaturated
+  of isUnavailable: emUnavailable
+
 proc detach*[K](p: var SetProducerT[K]) = p.s.detach()
 
 # --- consumer / host side ---------------------------------------------------

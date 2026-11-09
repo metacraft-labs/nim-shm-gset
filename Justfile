@@ -34,8 +34,12 @@ nim_flags := "--hints:off --threads:on --warning:BareExcept:off --path:src --pat
 #
 # THE COUNT IS NOW PER-PLATFORM, because the suite runs natively on Windows too:
 #
-#   Linux   x86-64   114 [OK]  0 [FAILED]  0 [SKIPPED]
+#   Linux   x86-64   136 [OK]  0 [FAILED]  0 [SKIPPED]  (re-measured 2026-11-09)
 #   Windows x86-64   112 [OK]  0 [FAILED]  0 [SKIPPED]  + 3 NOT-APPLICABLE
+#                    (2026-09-14; NOT re-measured since)
+#
+# The Linux count was already 130 before the `emitNoGrow` cases (+6) were
+# added, so the reconciliation below describes the 2026-09-14 counts only.
 #
 # The two reconcile exactly. Three cases assert POSIX PROCESS SEMANTICS that
 # have no Windows counterpart — a `fork` child holding an inherited `ptr
