@@ -128,6 +128,10 @@ setEnv("REPRO_MONITOR_DEP_SHM", s.path0)
 # PRODUCER: attach by shard0 path; insert is idempotent + lossless.
 var p = attachSet(path0)
 discard p.insert(elementBytes)         # isInserted | isExists | isSaturated | isUnavailable
+# From a signal handler, or with no file descriptor left: shard0 only, never
+# grows. A full shard0 bumps the growth-failure counter instead (isSaturated),
+# so the element's absence is still signalled.
+discard p.insertNoGrow(lossElementBytes)
 
 # CONSUMER: single-threaded union (source of truth for the depfile).
 for element in s.items: ...
