@@ -471,7 +471,7 @@ type
   InsertStatus* = enum
     isInserted    ## a NEW element was published into a slot
     isExists      ## the element was already present (idempotent no-op)
-    isSaturated   ## growth itself failed (OOM): SIGNALLED, surfaced by consumer
+    isSaturated   ## growth failed, or the newest shard will not map: SIGNALLED, surfaced by consumer
     isUnavailable ## the set is not attached (portable no-op arm / attach failed)
 
   ResetStatus* = enum
@@ -1404,7 +1404,9 @@ when shmGSetSupported:
     ## Idempotent multi-producer insert. Re-observing an element is a no-op
     ## (`isExists`) — the structure is bounded by DISTINCT elements, not events,
     ## so backpressure never arises. A full shard/arena GROWS (never drops); only
-    ## an OOM growth failure returns `isSaturated` (SIGNALLED, never silent).
+    ## a growth failure (OOM, the shard-size cap) or a newest shard that will
+    ## not map returns `isSaturated`, and each bumps the growth-failure counter
+    ## first (SIGNALLED, never silent).
     ##
     ## Placement is by PRIMARY KEY (`primaryKeySpan` + `hashKey`); dedup is by
     ## IDENTITY (`identityFp` + `identityEq`). No heap allocation on this path.
@@ -1427,7 +1429,16 @@ when shmGSetSupported:
     while true:
       let n = chainCount(s)
       let newestIdx = n - 1
-      if not openShard(s, newestIdx): return isSaturated
+      if not openShard(s, newestIdx):
+        # The newest shard exists in the chain count but will not map: a
+        # foreign file won growth's exclusive link (another boot's leftover, a
+        # layout skew, a truncated file), or this process cannot map it. The
+        # element does not reach the set, so this is the same SIGNALLED
+        # saturation as a failed growth — counted, never silent. Without the
+        # bump a consumer would keep honouring completeness claims for a set
+        # that is missing every element inserted from here on.
+        bumpGenStamped(s.shards[0].base, ShOffGrowthFailed, gen, 1)
+        return isSaturated
       case insertIntoShard(K, s.shards[newestIdx], blob, keyHash, ifp, gen)
       of siInserted:
         if shouldGrow(s.shards[newestIdx], gen) and chainCount(s) == n:
@@ -1685,7 +1696,8 @@ when shmGSetSupported:
           loadU64Relaxed(s.shards[k].base, ShOffOccupied), gen)
 
   proc growthFailures*[K](s: var ShmGSetT[K]): uint64 =
-    ## SIGNALLED saturation count (OOM growth failures) FOR THE CURRENT
+    ## SIGNALLED saturation count (failed growths, newest-shard map failures on
+    ## insert, and `insertNoGrow` refusals) FOR THE CURRENT
     ## GENERATION. Nonzero ⇒ the consumer surfaces `mcIncomplete`; it is NEVER a
     ## silent drop. A recycled chain does not inherit the previous action's
     ## saturation — it starts empty with all its shards already grown, so the

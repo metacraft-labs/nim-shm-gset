@@ -34,7 +34,7 @@ nim_flags := "--hints:off --threads:on --warning:BareExcept:off --path:src --pat
 #
 # THE COUNT IS NOW PER-PLATFORM, because the suite runs natively on Windows too:
 #
-#   Linux   x86-64   136 [OK]  0 [FAILED]  0 [SKIPPED]  (re-measured 2026-11-09)
+#   Linux   x86-64   137 [OK]  0 [FAILED]  0 [SKIPPED]  (re-measured 2026-11-18)
 #   Windows x86-64   112 [OK]  0 [FAILED]  0 [SKIPPED]  + 3 NOT-APPLICABLE
 #                    (2026-09-14; NOT re-measured since)
 #

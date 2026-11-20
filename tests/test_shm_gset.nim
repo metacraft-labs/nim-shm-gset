@@ -194,6 +194,39 @@ suite "membership + idempotent inserts":
     check s.claimedSlots() < uint64(expected.len * 2)
     s.detach()
 
+  test "an insert that cannot open the newest shard is SIGNALLED, never silent":
+    # Regression for reprobuild-pm issue
+    # `2026-11-18-gset-insert-saturates-without-signalling-when-the-newest-shard-will-not-open.md`.
+    # A file that is not a shard of this chain (another boot's leftover, a
+    # layout skew, a file too short for a header) sits at the growth name
+    # `.shard1`. Growth finds the name taken and treats it as a racer's shard,
+    # so the chain count moves to 2 and every later
+    # insert finds a newest shard it cannot map. Each such `isSaturated` must
+    # have bumped the growth-failure counter: a consumer that honours a
+    # completeness claim while `growthFailures() == 0` would otherwise trust a
+    # set that is silently missing every element inserted from then on.
+    # Nothing is mocked: the planted file is real bytes on disk, and every
+    # insert runs the production `insert` path.
+    let dir = freshDir("unopenable-newest")
+    defer: removeDir(dir)
+    var s = createSet(dir, "io-mon", "edge", shard0Cap = 64, shard0ArenaCap = 8192)
+    check s.available
+    let p0 = s.path0
+    doAssert p0.endsWith(".shard0")
+    let p1 = p0[0 ..< p0.len - len(".shard0")] & ".shard1"
+    # Larger than a shard header, so the open fails on the header, not on size.
+    writeFile(p1, repeat('X', 64 * 1024))
+    var saturated = 0
+    for i in 0 ..< 200:
+      let before = s.growthFailures()
+      let st = s.insert(bytesOf("file-" & $i))
+      if st == isSaturated:
+        inc saturated
+        check s.growthFailures() > before    # this very insert was counted
+    check saturated > 0                       # the planted file did block growth
+    check s.growthFailures() >= uint64(saturated)
+    s.detach()
+
 # --- position-independence (offsets only, no absolute pointers) -------------
 
 suite "position-independence (design spec §4.5(b))":

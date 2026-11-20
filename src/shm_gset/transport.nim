@@ -30,7 +30,10 @@ type
     emExists       ## the element was already present (idempotent no-op)
     emConsumerGone ## the host/consumer marked itself gone (LF-4 fast-fail)
     emOversize     ## element exceeds the producer's hard cap ⇒ `mcIncomplete`
-    emSaturated    ## growth itself failed (OOM): SIGNALLED, never a silent drop
+    emSaturated    ## the element could not be published (growth failed, the newest
+                   ## shard will not map, or a no-grow insert found shard0 full):
+                   ## the growth-failure counter was bumped. SIGNALLED, never a
+                   ## silent drop
     emUnavailable  ## not attached (LF-2 fail-fast / portable no-op arm)
 
   SetProducerT*[K] = object
