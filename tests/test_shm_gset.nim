@@ -227,6 +227,118 @@ suite "membership + idempotent inserts":
     check s.growthFailures() >= uint64(saturated)
     s.detach()
 
+# --- a reader that cannot map a shard is SIGNALLED --------------------------
+
+when not defined(windows):
+  import std/posix
+
+  template withNoDescriptorLeft(exhausted: untyped; body: untyped) =
+    ## Run `body` while this process cannot open another descriptor, so an
+    ## `open` in it fails with EMFILE. `exhausted` is set to whether that state
+    ## was really reached. The soft limit is lowered first so the loop is
+    ## short whatever limit the test inherited, and both the descriptors and
+    ## the limit are given back even if `body` raises.
+    var lim, saved: RLimit
+    doAssert getrlimit(RLIMIT_NOFILE, lim) == 0
+    saved = lim
+    if lim.rlim_cur > 1024:
+      lim.rlim_cur = 1024
+      doAssert setrlimit(RLIMIT_NOFILE, lim) == 0
+    var held: seq[cint] = @[]
+    try:
+      while true:
+        let fd = posix.open("/dev/null", O_RDONLY)
+        if fd < 0:
+          exhausted = errno == EMFILE
+          break
+        held.add fd
+      body
+    finally:
+      for fd in held: discard posix.close(fd)
+      discard setrlimit(RLIMIT_NOFILE, saved)
+
+suite "a shard a reader cannot map (SIGNALLED, never silent)":
+  when defined(windows):
+    notApplicableHere("a reader walk that skips a present, unmappable shard is counted",
+      "the test exhausts POSIX file descriptors to make a shard unmappable")
+    notApplicableHere("a reader walk that skips a RETIRED or uncounted shard is not counted",
+      "the control for the POSIX-only case above; it is not run without it")
+  else:
+    test "a reader walk that skips a present, unmappable shard is counted":
+      # A reader skips a shard it cannot open. That is right for a shard a
+      # flattener retired (the file is gone and its elements were copied
+      # forward) and wrong for one whose file is still there: the elements
+      # exist and the walk does not see them. Each reader walk (`contains`,
+      # `withPrimaryKey`, `items`) must then bump the growth-failure counter,
+      # because a consumer that trusts the set while `growthFailures() == 0`
+      # would otherwise trust an answer with elements missing.
+      # Nothing is mocked: the chain is real files, the second view is a real
+      # attach, and the map failure is a real EMFILE from `open`.
+      let dir = freshDir("unmappable-reader")
+      defer: removeDir(dir)
+      var owner = createSet(dir, "io-mon", "edge", shard0Cap = 64, shard0ArenaCap = 2048)
+      check owner.available
+      for i in 0 ..< 1500:               # force several shards
+        discard owner.insert(bytesOf("elem-" & $i))
+      check owner.shardCount() > 1
+      check owner.growthFailures() == 0
+      let newest = bytesOf("elem-1499")  # lives in a grown shard, not shard0
+      check owner.contains(newest)
+
+      # A second view maps shard0 at attach and every other shard lazily, so
+      # with no descriptor left it cannot map the grown shards.
+      var view = attachSet(owner.path0)
+      check view.available
+      let before = view.growthFailures()
+      var exhausted, seen = false
+      var afterContains, afterRun, afterItems: uint64
+      var unionLen = 0
+      withNoDescriptorLeft(exhausted):
+        seen = view.contains(newest)
+        afterContains = view.growthFailures()
+        for v in view.withPrimaryKey(newest): discard
+        afterRun = view.growthFailures()
+        for e in view.items: inc unionLen
+        afterItems = view.growthFailures()
+
+      require exhausted                   # else the cases below prove nothing
+      check before == 0
+      check not seen                      # the walk really did miss the element
+      check afterContains > before        # ... and said so
+      check afterRun > afterContains
+      check unionLen < 1500
+      check afterItems > afterRun
+      check owner.growthFailures() == afterItems   # chain-wide, not per handle
+
+      # With descriptors back the same view maps the shards and sees the set.
+      check view.contains(newest)
+      view.detach(); owner.detach()
+
+    test "a reader walk that skips a RETIRED or uncounted shard is not counted":
+      # The control for the case above. A drained and unlinked shard is a
+      # legitimate skip. So is a file at an index the chain count has not
+      # reached: no insert can have targeted it, so it holds no element.
+      let dir = freshDir("retired-reader")
+      defer: removeDir(dir)
+      var owner = createSet(dir, "io-mon", "edge", shard0Cap = 64, shard0ArenaCap = 2048)
+      check owner.available
+      for i in 0 ..< 1500:
+        discard owner.insert(bytesOf("elem-" & $i))
+      let n = owner.shardCount()
+      check n > 2
+      check owner.markShardDrained(1)
+      check owner.retireShard(1)
+      let p0 = owner.path0
+      writeFile(p0[0 ..< p0.len - len(".shard0")] & ".shard" & $n,
+        repeat('X', 64 * 1024))           # not a shard, and not counted
+      var view = attachSet(owner.path0)
+      check view.available
+      discard view.contains(bytesOf("elem-1499"))
+      for v in view.withPrimaryKey(bytesOf("elem-1499")): discard
+      for e in view.items: discard
+      check view.growthFailures() == 0
+      view.detach(); owner.detach()
+
 # --- position-independence (offsets only, no absolute pointers) -------------
 
 suite "position-independence (design spec §4.5(b))":

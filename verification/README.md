@@ -121,7 +121,7 @@ suite now runs NATIVELY ON WINDOWS as well, so the count is per-platform:
 
 | platform | `[OK]` | `[FAILED]` | `[SKIPPED]` | not-applicable |
 |---|---|---|---|---|
-| Linux x86-64 (re-measured 2026-11-18) | 137 | 0 | 0 | 0 |
+| Linux x86-64 (re-measured 2026-11-19) | 139 | 0 | 0 | 0 |
 | Windows x86-64 (2026-09-14, not re-measured since) | 112 | 0 | 0 | 3 |
 
 The Linux count was already 130 before the six `emitNoGrow` cases were added,

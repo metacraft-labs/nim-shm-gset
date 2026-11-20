@@ -530,6 +530,8 @@ func validRunId*(runId: string): bool =
 
 when shmGSetSupported:
   import std/[os, sets, strutils]
+  when not defined(windows):
+    from std/posix import Stat, stat, errno, ENOENT, ENOTDIR
 
   type
     ShmBase = ptr UncheckedArray[byte]
@@ -556,6 +558,11 @@ when shmGSetSupported:
       shards: seq[ShardMap]     ## index == shardId; lazily mapped
       tmpCtr: int
       failure: AttachFailure    ## why `available` is false (see `attachFailure`)
+      lastOpenAbsent: bool      ## set by every FAILED `openShard`: true iff the
+                                ## shard's file is known not to exist (retired),
+                                ## false when it is present, or its presence
+                                ## could not be determined. Read by
+                                ## `noteUnmappableShard` right after the call.
       producerPid: uint64       ## the pid that claimed `producerSlot`. A FORKED
                                 ## child inherits this handle verbatim, so the
                                 ## release path compares it against the caller's
@@ -840,6 +847,19 @@ when shmGSetSupported:
     result.arenaOff = int(loadU64Relaxed(base, ShOffArenaOff))
     result.arenaCap = int(loadU64Relaxed(base, ShOffArenaCap))
 
+  proc shardFileAbsent(path: string): bool =
+    ## True only when `path` is KNOWN not to exist. A probe that fails for any
+    ## other reason (permissions, memory, I/O, a symlink loop) answers false:
+    ## the file may be there, and a reader that treated "could not tell" as
+    ## "retired" would skip a shard's elements without saying so.
+    when defined(windows):
+      not fileExists(path) and not dirExists(path)
+    else:
+      var st: Stat
+      if stat(path.cstring, st) == 0: return false
+      let e = errno
+      e == ENOENT or e == ENOTDIR
+
   proc shardPath[K](s: ShmGSetT[K]; k: int): string =
     s.basePrefix & ".shard" & $k
 
@@ -853,17 +873,26 @@ when shmGSetSupported:
     mixin keyFormatVersion
     if k < s.shards.len and not s.shards[k].base.isNil: return true
     let path = shardPath(s, k)
+    # Every failure below leaves `lastOpenAbsent` saying whether the file is
+    # KNOWN to be gone. It starts false, so a failure that does not establish
+    # absence reads as "present": the direction that gets the skip counted.
+    s.lastOpenAbsent = false
     var tries = 0
     while true:
-      if fileExists(path):
+      if not shardFileAbsent(path):
         var size = 0
         try: size = int(getFileSize(path))
         except CatchableError:
+          # Retired between the probe and here, or present and unreadable.
+          s.lastOpenAbsent = shardFileAbsent(path)
           s.failure = afMissing; return false
         if size <= ShardHeaderSize:
           s.failure = afTruncated; return false
         let fd = openReadWrite(path)
         if not fd.isValid:
+          # Retired between the probe and the open (absent), or the open was
+          # refused: a descriptor limit, permissions (present).
+          s.lastOpenAbsent = shardFileAbsent(path)
           s.failure = afMissing; return false
         var why = afNone
         let sm = mapShardFromFd(fd, size, s.boot, keyFormatVersion(K), why)
@@ -875,9 +904,11 @@ when shmGSetSupported:
         s.shards[k] = sm
         return true
       if not patient:
+        s.lastOpenAbsent = true
         s.failure = afMissing; return false
       inc tries
       if tries > 10000:
+        s.lastOpenAbsent = true
         s.failure = afMissing; return false
       yieldThread()
 
@@ -955,10 +986,52 @@ when shmGSetSupported:
   proc bumpGenStamped(base: ShmBase; off: int; gen, delta: uint64) =
     ## Add `delta` to a generation-stamped counter, rebasing from 0 if the
     ## counter was last written under another generation.
+    ##
+    ## The value SATURATES at the field's maximum instead of wrapping. These
+    ## counters are read as "zero or not", and a reader that keeps failing to
+    ## map a shard bumps one on every walk: a wrap would read as zero again.
     var cur = loadU64Acquire(base, off)
     while true:
-      let desired = packGenStamped(gen, genStampedValue(cur, gen) + delta)
-      if casU64(base, off, cur, desired): return
+      let v = genStampedValue(cur, gen)
+      let nv = if delta >= SlotOffMask - v: SlotOffMask else: v + delta
+      if (cur shr SlotGenShift) == gen and nv == v: return   # already saturated
+      if casU64(base, off, cur, packGenStamped(gen, nv)): return
+
+  proc noteUnmappableShard[K](s: var ShmGSetT[K]; k: int) =
+    ## A READER WALK calls this for a shard it is about to skip, immediately
+    ## after `openShard` returned false for it. Two very different states
+    ## produce that:
+    ##
+    ## * the file is ABSENT — a flattener retired it after copying its live
+    ##   elements forward. Skipping it is right and loses nothing;
+    ## * the file is PRESENT and this process could not map it — a descriptor
+    ##   or address-space limit, permissions, or a file that fails the header
+    ##   check. Its elements exist and this walk does not see them.
+    ##
+    ## The second is counted in the growth-failure counter, the one signal a
+    ## consumer already consults before trusting the set: the walk's answer may
+    ## be missing elements, and so may every decision this process derives
+    ## from it (a liveness test before an insert, a completeness claim). It is
+    ## SIGNALLED, never silent, exactly like an insert that could not land.
+    ##
+    ## Only a file KNOWN to be gone is the first state (`shardFileAbsent`). If
+    ## the probe could not tell, the skip is counted.
+    ##
+    ## A present file at an index the chain count has not reached is not
+    ## counted. An element only ever lands in shard `chainCount - 1` as its
+    ## inserter observed it, so such a file — a grower's link whose count bump
+    ## has not happened — holds nothing a walk could miss.
+    ##
+    ## No syscall is added: `openShard` already probed the file, and this reads
+    ## the answer it left on the handle. The generation is re-read here, not
+    ## taken from the walk's start, so the bump is stamped for the generation
+    ## that is current when it lands.
+    if s.lastOpenAbsent: return
+    if s.shards.len == 0 or s.shards[0].base.isNil: return
+    if k >= chainCount(s): return
+    let gen = currentGeneration(s)
+    if gen == GenerationNone: return
+    bumpGenStamped(s.shards[0].base, ShOffGrowthFailed, gen, 1)
 
   type InsertShardResult = enum siInserted, siExists, siNeedGrow
 
@@ -1497,9 +1570,15 @@ when shmGSetSupported:
     isSaturated
 
   proc contains*[K](s: var ShmGSetT[K]; blob: openArray[byte]): bool =
-    ## Identity membership across the whole chain (probing, no mutation). For the
+    ## Identity membership across the whole chain (probing; the set's elements
+    ## are never mutated). For the
     ## reader's authoritative distinct set use `snapshot`; to enumerate everything
     ## sharing `blob`'s primary key use `withPrimaryKey`.
+    ##
+    ## A `false` is only as good as the shards this process could map: a shard
+    ## whose file is present but would not map is skipped and COUNTED in
+    ## `growthFailures` (see `noteUnmappableShard`), so check that counter
+    ## AFTER the call before trusting an absence.
     mixin primaryKeySpan, hashKey, identityFp
     if not s.available: return false
     let span = primaryKeySpan(K, blob)
@@ -1511,6 +1590,7 @@ when shmGSetSupported:
     var k = 0
     while k < chainCount(s):
       if not openShard(s, k, patient = false):
+        noteUnmappableShard(s, k)
         inc k; continue
       let sm = s.shards[k]
       if sm.isDrained:
@@ -1543,6 +1623,12 @@ when shmGSetSupported:
     ## in shard0, so `0 ..< chainCount` covers every element-bearing shard. This
     ## walk therefore performs NO syscall once the shards are mapped.
     ##
+    ## A shard this process cannot map is skipped. If its file is gone it was
+    ## retired and nothing is lost; if its file is PRESENT the walk is missing
+    ## elements, and that skip is counted in `growthFailures` (see
+    ## `noteUnmappableShard`). A caller that derives "this is everything" from
+    ## the walk must read `growthFailures` AFTER the walk, not before it.
+    ##
     ## OLDEST-FIRST IS LOAD-BEARING under flattening: a flattener copies a
     ## shard's live elements FORWARD and only then marks the source drained, so a
     ## reader that visits the source before the destination sees the elements in
@@ -1559,6 +1645,7 @@ when shmGSetSupported:
       var k = 0
       while gen != GenerationNone and k < chainCount(s):
         if not openShard(s, k, patient = false):
+          noteUnmappableShard(s, k)
           inc k; continue
         let sm = s.shards[k]
         if sm.isDrained:
@@ -1655,12 +1742,18 @@ when shmGSetSupported:
     ## writes fold cleanly; ordering is irrelevant (the output is canonicalized).
     ## Shards are visited oldest-first, and a drained shard is skipped — see
     ## `withPrimaryKeyHash` for why that order is the safe one under flattening.
+    ## A shard whose file is present but will not map is skipped too, and that
+    ## skip is counted in `growthFailures`: a consumer that reads the counter
+    ## AFTER the union grades the result incomplete instead of taking it for
+    ## the whole set.
     if s.available:
       var seen = initHashSet[seq[byte]]()
       let gen = currentGeneration(s)
       let maxK = discoverMaxShard(s)
       for k in 0 .. maxK:
-        if not openShard(s, k, patient = false): continue
+        if not openShard(s, k, patient = false):
+          noteUnmappableShard(s, k)
+          continue
         let sm = s.shards[k]
         if sm.isDrained: continue
         for idx in 0 ..< sm.cap:
@@ -1697,7 +1790,8 @@ when shmGSetSupported:
 
   proc growthFailures*[K](s: var ShmGSetT[K]): uint64 =
     ## SIGNALLED saturation count (failed growths, newest-shard map failures on
-    ## insert, and `insertNoGrow` refusals) FOR THE CURRENT
+    ## insert, `insertNoGrow` refusals, and reader walks that skipped a shard
+    ## whose file is present but would not map) FOR THE CURRENT
     ## GENERATION. Nonzero ⇒ the consumer surfaces `mcIncomplete`; it is NEVER a
     ## silent drop. A recycled chain does not inherit the previous action's
     ## saturation — it starts empty with all its shards already grown, so the
