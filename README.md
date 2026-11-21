@@ -136,6 +136,8 @@ discard p.insertNoGrow(lossElementBytes)
 # CONSUMER: single-threaded union (source of truth for the depfile).
 for element in s.items: ...
 echo s.shardCount(), s.growthFailures()  # metrics; growthFailures>0 ⇒ mcIncomplete
+# shardCount is the directory view. Inserts go to insertShardIndex(), which
+# can be one lower; a flattener bounds its range by that, not by shardCount.
 ```
 
 ## Reset and recycling

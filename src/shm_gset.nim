@@ -1484,7 +1484,10 @@ when shmGSetSupported:
     ## Placement is by PRIMARY KEY (`primaryKeySpan` + `hashKey`); dedup is by
     ## IDENTITY (`identityFp` + `identityEq`). No heap allocation on this path.
     ##
-    ## The probe is confined to the NEWEST shard: an element already present in
+    ## The probe is confined to the NEWEST shard, meaning the one the chain
+    ## count names (`insertShardIndex`). If that shard is drained the chain is
+    ## damaged: the call counts a growth failure and grows past it rather than
+    ## publish where readers do not look. An element already present in
     ## an older shard may be claimed again here, which is the harmless cross-shard
     ## duplicate the union folds. A consumer that wants the chain-wide
     ## "already present?" answer (e.g. to skip an insert entirely) reads it with
@@ -1512,6 +1515,25 @@ when shmGSetSupported:
         # that is missing every element inserted from here on.
         bumpGenStamped(s.shards[0].base, ShOffGrowthFailed, gen, 1)
         return isSaturated
+      if newestIdx > 0 and s.shards[newestIdx].isDrained:
+        # Readers skip a drained shard, so an element placed here would be
+        # published and never seen. `markShardDrained` refuses the insert
+        # target, so the chain is damaged: a flattener without that refusal
+        # drained this shard, or growth adopted a drained shard another chain
+        # left at this name. Elements already in the shard are invisible and
+        # this call cannot bring them back, so the damage is SIGNALLED in the
+        # growth-failure counter, as a failed growth is. Then move past the
+        # shard: grow (or adopt the shard a stopped grower already linked at
+        # the next name) and retry there, so later elements are seen.
+        #
+        # This is a check before the slot claim, not a guarantee about it. An
+        # insert that read the count, and then lost the processor while the
+        # chain grew and a flattener drained this shard, still places its
+        # element here. See `markShardDrained`.
+        bumpGenStamped(s.shards[0].base, ShOffGrowthFailed, gen, 1)
+        if not growNewest(s, n, s.shards[newestIdx], gen):
+          return isSaturated
+        continue
       case insertIntoShard(K, s.shards[newestIdx], blob, keyHash, ifp, gen)
       of siInserted:
         if shouldGrow(s.shards[newestIdx], gen) and chainCount(s) == n:
@@ -1776,6 +1798,22 @@ when shmGSetSupported:
     if not s.available: return 0
     discoverMaxShard(s) + 1
 
+  proc insertShardIndex*[K](s: var ShmGSetT[K]): int =
+    ## The index of the shard `insert` targets right now: the chain count
+    ## minus one, or -1 when the set is not attached. It only ever rises.
+    ##
+    ## This is NOT `shardCount() - 1`. A grower links its new shard before it
+    ## bumps the chain count, so the directory (which `shardCount` and every
+    ## reader scan) can hold one shard more than the count that inserts follow:
+    ## a grower stopped between the two steps, or a file left at the next name.
+    ## A flattener must take the upper bound of its range from here: a shard
+    ## at or above this index is where new inserts go, so copying it "forward"
+    ## copies it into itself. A shard below it is no longer the target of any
+    ## insert that STARTS now. An insert that read the count before the chain
+    ## grew can still be in flight toward such a shard; see `markShardDrained`.
+    if not s.available: return -1
+    chainCount(s) - 1
+
   proc claimedSlots*[K](s: var ShmGSetT[K]): uint64 =
     ## Sum of claimed slots across shards. An UPPER bound on distinct elements
     ## (an element inserted before and after a grow is counted in two shards);
@@ -2000,7 +2038,22 @@ when shmGSetSupported:
     ## MUST be called only after those copies have succeeded: the flag is what
     ## permits readers to skip the shard. Never cleared. shard0 is never drained
     ## (it carries the control block).
+    ##
+    ## Refuses (returns false) the shard inserts target and any shard above it,
+    ## i.e. every `k >= insertShardIndex()`. Copying such a shard "forward"
+    ## copies it into itself, so draining it would hide every element it holds
+    ## and every element inserted into it afterwards. The chain count only
+    ## rises, so a shard below the insert target stays below it: a concurrent
+    ## grower cannot turn an accepted shard back into the insert target.
+    ##
+    ## NOT COVERED: an insert already in flight. `insert` reads the count once
+    ## per attempt. If the chain then grows and a flattener copies and drains
+    ## the shard that insert chose before its slot claim lands, the element is
+    ## published in a drained shard and no reader sees it. Nothing here
+    ## excludes that; a caller that drains shards while other processes insert
+    ## must tolerate it or prevent it.
     if not s.available or k <= 0: return false
+    if k >= chainCount(s) - 1: return false
     if not openShard(s, k, patient = false): return false
     let b = s.shards[k].base
     var cur = loadU32Acquire(b, ShOffFlags)
@@ -2259,6 +2312,7 @@ else:
   iterator items*[K](s: var ShmGSetT[K]): seq[byte] = discard
   proc snapshot*[K](s: var ShmGSetT[K]): seq[seq[byte]] = @[]
   proc shardCount*[K](s: var ShmGSetT[K]): int = 0
+  proc insertShardIndex*[K](s: var ShmGSetT[K]): int = -1
   proc claimedSlots*[K](s: var ShmGSetT[K]): uint64 = 0
   proc growthFailures*[K](s: var ShmGSetT[K]): uint64 = 0
   proc markConsumerGone*[K](s: var ShmGSetT[K]) = discard

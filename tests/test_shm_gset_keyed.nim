@@ -927,3 +927,168 @@ suite "G. flatten-then-retire never makes an element unobservable":
     check after.retireShard(1)
     after.detach()
     s.detach()
+
+  # G5 and G6 are the regression cases for reprobuild-pm issue
+  # `2026-11-18-action-index-flatten-can-retire-the-live-newest-shard.md`.
+  #
+  # `insert` targets the shard the chain COUNT names. `shardCount` (and
+  # `items`/`snapshot`) also scan the directory, because a grower links its
+  # new shard before it bumps the count. So the directory can show one shard
+  # more than the count: a grower stopped between the two steps, or a file
+  # left at the next name. A flattener that ranges over `shardCount` then reaches the
+  # shard inserts still target, "copies" it into itself, drains it and unlinks
+  # it, and every element in it vanishes.
+
+  proc shardFile(path0: string; k: int): string =
+    path0[0 ..< path0.len - 1] & $k
+
+  proc growToShards(s: var ShmGSetT[AcIndexKey]; shards: int; tag: string) =
+    ## Insert distinct elements until the chain has exactly `shards` shards.
+    ## The insert that crosses the load factor creates the next shard EMPTY, so
+    ## on return the newest shard holds nothing.
+    var i = 0
+    while s.shardCount() < shards and i < 100_000:
+      discard s.acInsert(akRecord, fpOf(tag & "-w-" & $i), fpOf(tag & "-s-" & $i))
+      inc i
+    doAssert s.shardCount() == shards
+
+  test "G5 the insert target is never drained, whatever the directory shows":
+    let dir = freshDir("flatten-target")
+    defer: removeDir(dir)
+    var s = createSetT(dir, "repro", "flatT", AcIndexKey,
+      shard0Cap = 16, shard0ArenaCap = 1024)
+    check s.available
+    s.growToShards(3, "main")
+    check s.insertShardIndex() == 2
+
+    # A real, fully initialised, empty shard 3 appears and the count is not
+    # bumped: what a grower leaves when it stops between `link` and the bump.
+    # It is taken from a twin chain grown one shard further.
+    block:
+      let twinDir = freshDir("flatten-target-twin")
+      defer: removeDir(twinDir)
+      var twin = createSetT(twinDir, "repro", "flatT", AcIndexKey,
+        shard0Cap = 16, shard0ArenaCap = 1024)
+      check twin.available
+      twin.growToShards(4, "twin")
+      copyFile(shardFile(twin.path0, 3), shardFile(s.path0, 3))
+      twin.detach()
+    check s.shardCount() == 4               # the directory view
+    check s.insertShardIndex() == 2         # the view inserts follow
+
+    let w = fpOf("target-edge")
+    check s.acInsert(akRecord, w, fpOf("target-strong")) == isInserted
+    let before = s.liveIdSet(w)
+    check before.len == 1
+
+    # What a flattener ranging over `shardCount()` does to shard 2.
+    var copied: seq[seq[byte]]
+    for v in s.shardElements(2): copied.add v.toBytesSeq()
+    check copied.len > 0
+    for e in copied: check s.insert(e) == isExists    # it IS the target
+    check (not s.markShardDrained(2))                 # refused
+    check (not s.shardIsDrained(2))
+    check (not s.retireShard(2))                      # not drained => refused
+    check fileExists(shardFile(s.path0, 2))
+    check s.liveIdSet(w) == before
+
+    # Shard 1 is below the insert target, so it drains as before.
+    for v in s.shardElements(1): discard s.insert(v.toBytesSeq())
+    check s.markShardDrained(1)
+
+    # Once inserts have moved on, shard 2 is an older shard like any other.
+    s.growToShards(5, "more")
+    check s.insertShardIndex() >= 3
+    var copied2: seq[seq[byte]]
+    for v in s.shardElements(2): copied2.add v.toBytesSeq()
+    for e in copied2: check s.insert(e) in {isInserted, isExists}
+    check s.markShardDrained(2)
+    check s.retireShard(2)
+    check s.liveIdSet(w) == before
+    s.detach()
+
+  proc drainThroughTheFile(path: string) =
+    ## Set the drained flag in a shard's header through the file. That is what
+    ## a flattener WITHOUT G5's refusal leaves behind (an older build sharing
+    ## the chain); the library no longer offers a call that does it to the
+    ## insert target.
+    var f = open(path, fmReadWriteExisting)
+    defer: f.close()
+    f.setFilePos(ShOffFlags)
+    var flags = ShFlagDrained
+    doAssert f.writeBuffer(addr flags, 4) == 4
+
+  test "G6 an insert moves past a drained target, and signals the damage":
+    # Defence in depth for a damaged chain: the insert target is drained.
+    # Elements already in it are invisible and stay so, which is why the
+    # insert that finds the state counts a growth failure before it moves on.
+    let dir = freshDir("flatten-drained-target")
+    defer: removeDir(dir)
+    var s = createSetT(dir, "repro", "flatD", AcIndexKey,
+      shard0Cap = 16, shard0ArenaCap = 1024)
+    check s.available
+    s.growToShards(2, "main")
+    check s.insertShardIndex() == 1
+    drainThroughTheFile(shardFile(s.path0, 1))
+    check s.shardIsDrained(1)
+
+    let failuresBefore = s.growthFailures()
+    let w = fpOf("past-drained-edge")
+    check s.acInsert(akRecord, w, fpOf("past-drained-strong")) == isInserted
+    check s.insertShardIndex() == 2         # it grew past the drained shard
+    check s.liveIdSet(w).len == 1           # and the element is observable
+    check s.growthFailures() > failuresBefore       # SIGNALLED, never silent
+    # With one inserter, only the insert that found the damage counts it
+    # (concurrent inserters that read the old count may each add one).
+    let failuresAfter = s.growthFailures()
+    check s.acInsert(akRecord, fpOf("past-drained-edge-2"),
+      fpOf("past-drained-strong-2")) == isInserted
+    check s.growthFailures() == failuresAfter
+    let path0 = s.path0
+    s.detach()
+    var fresh = attachSetT(path0, AcIndexKey)
+    check fresh.available
+    check fresh.liveIdSet(w).len == 1
+    fresh.detach()
+
+  test "G7 a drained AND unlinked target saturates a process that never mapped it":
+    # What the flattener without G5's refusal actually left: it drained the
+    # insert target and unlinked it. A process that never mapped the shard
+    # cannot open it, so it cannot move past it either. Its inserts are the
+    # SIGNALLED saturation of an unopenable newest shard, never a silent
+    # success. A process that still maps the shard grows past it, and that
+    # repairs the chain for everyone.
+    let dir = freshDir("flatten-unlinked-target")
+    defer: removeDir(dir)
+    var s = createSetT(dir, "repro", "flatU", AcIndexKey,
+      shard0Cap = 16, shard0ArenaCap = 1024)
+    check s.available
+    s.growToShards(2, "main")
+    check s.insertShardIndex() == 1
+    # `s` maps shard 1 now, by inserting into it; growing alone does not.
+    check s.acInsert(akRecord, fpOf("unlinked-pre"), fpOf("unlinked-pre-s")) ==
+      isInserted
+    drainThroughTheFile(shardFile(s.path0, 1))
+    removeFile(shardFile(s.path0, 1))
+
+    var fresh = attachSetT(s.path0, AcIndexKey)
+    check fresh.available
+    let before = fresh.growthFailures()
+    check fresh.acInsert(akRecord, fpOf("unlinked-edge"),
+      fpOf("unlinked-strong")) == isSaturated
+    check fresh.growthFailures() > before
+    check fresh.insertShardIndex() == 1     # it could not move past
+
+    # The holder of the old mapping sees the drained flag and grows past it.
+    let w = fpOf("unlinked-edge-holder")
+    check s.acInsert(akRecord, w, fpOf("unlinked-strong-holder")) == isInserted
+    check s.insertShardIndex() == 2
+    check s.liveIdSet(w).len == 1
+    # Now the process that never mapped shard 1 has a target it can open.
+    let w2 = fpOf("unlinked-edge-after")
+    check fresh.acInsert(akRecord, w2, fpOf("unlinked-strong-after")) ==
+      isInserted
+    check fresh.liveIdSet(w2).len == 1
+    check s.liveIdSet(w2).len == 1
+    fresh.detach()
+    s.detach()
