@@ -37,6 +37,14 @@ type
     spBeforeGenerationPublish ## everything staged; about to release-store the
                           ## new generation — the atomic commit point
     spAfterGenerationPublish  ## committed; about to drop the reset seal
+    # --- read-path cost seam ---
+    # Not a publish point: a COUNTER seam. It fires immediately before every
+    # filesystem call `openShard` issues for a shard this handle has not
+    # mapped (the existence probe, the size read, the open), so a test can
+    # count the syscalls a reader walk costs without strace. Appended at the
+    # end so every earlier point keeps its ordinal.
+    spShardFileProbe      ## about to issue a filesystem call for a shard file
+                          ## this handle has not mapped
 
   ScheduleHook* = proc (point: SchedulePoint) {.gcsafe, raises: [].}
 

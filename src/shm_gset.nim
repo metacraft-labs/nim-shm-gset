@@ -543,6 +543,10 @@ when shmGSetSupported:
       slotsOff: int
       arenaOff: int
       arenaCap: int
+      retired: bool   ## this handle found the shard's file KNOWN absent while
+                      ## the index was already below the chain count, so the
+                      ## shard was retired and its index is never probed again
+                      ## (see `openShard`). Only ever set while `base` is nil.
 
     ShmGSetT*[K] = object
       ## An attached view of a run's shard chain, under key discipline `K`
@@ -863,6 +867,25 @@ when shmGSetSupported:
   proc shardPath[K](s: ShmGSetT[K]; k: int): string =
     s.basePrefix & ".shard" & $k
 
+  proc chainCount[K](s: var ShmGSetT[K]): int {.inline.} =
+    int(loadU64Acquire(s.shards[0].base, ShOffChainCount))
+
+  proc knownRetired[K](s: ShmGSetT[K]; k: int): bool {.inline.} =
+    ## This handle has already established that shard `k` was retired (see
+    ## `openShard`). Pure memory read: no syscall.
+    k < s.shards.len and s.shards[k].retired
+
+  proc noteShardAbsent[K](s: var ShmGSetT[K]; k, countBeforeProbe: int) =
+    ## Record on the handle that `openShard` found shard `k`'s file KNOWN
+    ## absent, and remember it as RETIRED when that absence is proof of
+    ## retirement. See `openShard` for why the chain count read before the
+    ## first probe is what decides.
+    s.lastOpenAbsent = true
+    s.failure = afMissing
+    if k > 0 and k < countBeforeProbe:
+      if k >= s.shards.len: s.shards.setLen(k + 1)
+      s.shards[k].retired = true
+
   proc openShard[K](s: var ShmGSetT[K]; k: int; patient = true): bool =
     ## Map shard `k` into this process (idempotent). On the INSERT path (`patient`)
     ## it retries briefly to tolerate the window between a chain-count bump and
@@ -870,30 +893,97 @@ when shmGSetSupported:
     ## legitimately absent once a flattener has retired it, and a reader must not
     ## spin on that. For a chain that never retires a shard (io-mon) the two are
     ## indistinguishable — every index below the discovered maximum exists.
+    ##
+    ## RETIRED INDICES COST NOTHING AFTER THE FIRST PROBE. A flattener retires
+    ## a shard by unlinking its file, and the index stays below the chain count
+    ## for the life of the chain. A handle that never mapped that shard (any
+    ## process that attached after the flatten) would otherwise `stat` it on
+    ## every walk, so every lookup would pay one syscall per retired shard and
+    ## the cost would grow with each flatten. Instead the handle remembers,
+    ## per index, that the file was found KNOWN absent (`ENOENT`/`ENOTDIR`, the
+    ## `lastOpenAbsent = true` outcomes) and answers later calls for that index
+    ## from memory: false, `lastOpenAbsent = true`, `afMissing`, no syscall.
+    ##
+    ## That is sound only where absence proves retirement, which is decided by
+    ## the chain count read (acquire) BEFORE the first filesystem probe:
+    ##
+    ## * `k` below that count: a grower links a shard's file under its final
+    ##   name before it bumps the count (`growNewest` -> `appendShardFile`,
+    ##   then `bumpChainCountTo`), so the file existed by the time the count
+    ##   passed `k`. Finding it absent now means it was unlinked — by
+    ##   `retireShard`, or by a reaper removing the whole chain — and neither
+    ##   is ever undone for this chain. Remembered.
+    ## * `k` at or above that count: the file may simply not have been created
+    ##   yet (the insert path's window between the bump it observed and the
+    ##   file appearing, or an index `items` reached through the directory
+    ##   scan). Such an index may appear later and is never remembered.
+    ##
+    ## A slow grower that read an old count could in principle re-link a fresh
+    ## EMPTY file at an already-retired index (`appendShardFile` checks only
+    ## that the name is free). No insert ever targets an index below
+    ## `chainCount - 1`, and retirement requires the index to be below that,
+    ## so such a file can hold no element, and treating the index as retired
+    ## loses nothing.
+    ##
+    ## A failure that is NOT known absence — a present file that is truncated,
+    ## refuses to open, fails the header check or will not map, or a probe that
+    ## failed with `EACCES`/`EIO` — is never remembered: those conditions can
+    ## clear, and `noteUnmappableShard` must keep counting each skip.
+    ##
+    ## The memo is only as precise as `shardFileAbsent`. Its Windows branch
+    ## still reads any `GetFileAttributesW` failure (`ERROR_ACCESS_DENIED`,
+    ## `ERROR_SHARING_VIOLATION`) as absence, so there a transient probe
+    ## failure below the chain count is remembered as retired for the life of
+    ## the handle instead of being re-probed on the next walk. That defect is
+    ## recorded as reprobuild-pm
+    ## `issues/2026-11-20-gset-windows-reader-probe-counts-an-unreadable-shard-as-retired.md`;
+    ## fixing it there makes this memo sound on Windows too.
+    ##
+    ## The memo lives in the handle's `shards` entry for `k` (whose `base` stays
+    ## nil), so it survives `reset` (a generation flip touches no shard file)
+    ## and is dropped with the rest of the handle's state by `detach`.
     mixin keyFormatVersion
-    if k < s.shards.len and not s.shards[k].base.isNil: return true
+    if k < s.shards.len:
+      if not s.shards[k].base.isNil: return true
+      if s.shards[k].retired:
+        s.lastOpenAbsent = true
+        s.failure = afMissing
+        return false
     let path = shardPath(s, k)
+    # Read BEFORE any probe; see "retired indices" above. Shard 0 is never
+    # retired (it carries the control block), and while it is being mapped
+    # there is no count to read, so 0 here simply disables the memo.
+    let countBeforeProbe =
+      if k > 0 and s.shards.len > 0 and not s.shards[0].base.isNil: chainCount(s)
+      else: 0
     # Every failure below leaves `lastOpenAbsent` saying whether the file is
     # KNOWN to be gone. It starts false, so a failure that does not establish
     # absence reads as "present": the direction that gets the skip counted.
     s.lastOpenAbsent = false
     var tries = 0
     while true:
+      scheduleHook(spShardFileProbe)
       if not shardFileAbsent(path):
         var size = 0
+        scheduleHook(spShardFileProbe)
         try: size = int(getFileSize(path))
         except CatchableError:
           # Retired between the probe and here, or present and unreadable.
-          s.lastOpenAbsent = shardFileAbsent(path)
-          s.failure = afMissing; return false
+          scheduleHook(spShardFileProbe)
+          if shardFileAbsent(path): noteShardAbsent(s, k, countBeforeProbe)
+          else: s.failure = afMissing
+          return false
         if size <= ShardHeaderSize:
           s.failure = afTruncated; return false
+        scheduleHook(spShardFileProbe)
         let fd = openReadWrite(path)
         if not fd.isValid:
           # Retired between the probe and the open (absent), or the open was
           # refused: a descriptor limit, permissions (present).
-          s.lastOpenAbsent = shardFileAbsent(path)
-          s.failure = afMissing; return false
+          scheduleHook(spShardFileProbe)
+          if shardFileAbsent(path): noteShardAbsent(s, k, countBeforeProbe)
+          else: s.failure = afMissing
+          return false
         var why = afNone
         let sm = mapShardFromFd(fd, size, s.boot, keyFormatVersion(K), why)
         closeFile(fd)
@@ -904,16 +994,11 @@ when shmGSetSupported:
         s.shards[k] = sm
         return true
       if not patient:
-        s.lastOpenAbsent = true
-        s.failure = afMissing; return false
+        noteShardAbsent(s, k, countBeforeProbe); return false
       inc tries
       if tries > 10000:
-        s.lastOpenAbsent = true
-        s.failure = afMissing; return false
+        noteShardAbsent(s, k, countBeforeProbe); return false
       yieldThread()
-
-  proc chainCount[K](s: var ShmGSetT[K]): int {.inline.} =
-    int(loadU64Acquire(s.shards[0].base, ShOffChainCount))
 
   proc currentGeneration[K](s: var ShmGSetT[K]): uint64 {.inline.} =
     ## The chain's generation, re-read from shard0 at the START of every
@@ -1643,7 +1728,9 @@ when shmGSetSupported:
     ## Completeness across the chain: an element only ever lands in shard
     ## `chainCount-1` as observed by its inserter, and `chainCount` is monotone
     ## in shard0, so `0 ..< chainCount` covers every element-bearing shard. This
-    ## walk therefore performs NO syscall once the shards are mapped.
+    ## walk therefore performs NO syscall once every present shard is mapped and
+    ## every retired index has been probed once by this handle (`openShard`
+    ## remembers a retired index; it does not `stat` it on each walk).
     ##
     ## A shard this process cannot map is skipped. If its file is gone it was
     ## retired and nothing is lost; if its file is PRESENT the walk is missing
@@ -2077,6 +2164,7 @@ when shmGSetSupported:
     ## MAPPED must never be mistaken for one that was drained. Only a header we
     ## actually read may authorise the unlink.
     if not s.available or k <= 0: return false
+    if s.knownRetired(k): return true         # already retired, known absent
     let path = shardPath(s, k)
     if not fileExists(path): return true      # already retired
     if not openShard(s, k, patient = false): return false
